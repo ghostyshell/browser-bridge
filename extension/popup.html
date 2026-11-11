@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Browser Bridge</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body class="popup">
+    <header class="head">
+      <div class="brand">
+        <span class="mark" aria-hidden="true"></span>
+        <div>
+          <h1>Browser Bridge</h1>
+          <p id="subtitle">checking status…</p>
+        </div>
+      </div>
+      <span id="status" class="pill">…</span>
+    </header>
+
+    <section id="pending" class="card pending" hidden>
+      <h2>Permission request</h2>
+      <p>The agent wants to work on <strong id="pendingOrigin"></strong></p>
+      <p class="muted" id="pendingUrl"></p>
+      <div class="row">
+        <button id="allowBtn" class="primary">Allow this site</button>
+        <button id="denyBtn" class="ghost">Block</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>Agent tab group</h2>
+        <button id="resetBtn" class="ghost small">Close all</button>
+      </div>
+      <p id="tabsLine" class="muted">no tabs</p>
+      <ul id="tabList" class="tabs"></ul>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>Allowed sites</h2>
+        <span id="allowedCount" class="muted"></span>
+      </div>
+      <ul id="allowedList" class="sites"></ul>
+      <form id="addForm" class="row">
+        <input id="addInput" type="text" placeholder="example.com" autocomplete="off" spellcheck="false" />
+        <button type="submit" class="primary small">Allow</button>
+      </form>
+    </section>
+
+    <section class="card">
+      <label class="switch">
+        <input id="autoAllow" type="checkbox" />
+        <span class="track" aria-hidden="true"><span class="knob"></span></span>
+        <span>
+          <strong>Allow every site</strong>
+          <em class="muted">Skip the per-site prompt. Only for a session you trust.</em>
+        </span>
+      </label>
+    </section>
+
+    <section id="help" class="card" hidden>
+      <h2>How it works</h2>
+      <p class="muted help-body">
+        Your agent runs <code>chromectl</code> in a terminal. Every action lands in the purple
+        <strong>Agent</strong> tab group, so you can watch it work and close it any time.
+        New sites need your approval here first.
+      </p>
+      <ul class="help-list">
+        <li><code>chromectl status</code> <span class="muted">connection, tabs, permissions</span></li>
+        <li><code>chromectl daemon stop</code> <span class="muted">hard stop, nothing can run</span></li>
+        <li><code>~/.config/browser-bridge/daemon.log</code></li>
+      </ul>
+    </section>
+
+    <footer class="foot">
+      <code>chromectl status</code>
+      <button id="helpBtn" class="linky">How it works</button>
+    </footer>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

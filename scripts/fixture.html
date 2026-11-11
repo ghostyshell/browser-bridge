@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Bridge fixture</title>
+    <style>
+      body {
+        font: 15px/1.5 -apple-system, system-ui, sans-serif;
+        max-width: 44rem;
+        margin: 3rem auto;
+        padding: 0 1.25rem;
+      }
+      label {
+        display: block;
+        margin-top: 0.75rem;
+        font-size: 13px;
+        color: #52525b;
+      }
+      input[type='text'],
+      select,
+      textarea {
+        font: inherit;
+        padding: 0.35rem 0.5rem;
+        border: 1px solid #d4d4d8;
+        border-radius: 6px;
+      }
+      button {
+        font: inherit;
+        margin-top: 0.75rem;
+        padding: 0.35rem 0.75rem;
+        border-radius: 6px;
+        border: 1px solid #d4d4d8;
+        background: #fff;
+      }
+      #result {
+        margin-top: 1rem;
+        font-weight: 600;
+        color: #6d28d9;
+      }
+      #editor {
+        margin-top: 1rem;
+        padding: 0.5rem;
+        border: 1px dashed #a1a1aa;
+      }
+      #later {
+        margin-top: 1rem;
+        color: #047857;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Bridge fixture</h1>
+    <p id="intro">A tiny local page for smoke-testing the Browser Bridge.</p>
+    <a href="/page2.html" id="next">Go to page two</a>
+
+    <form id="form">
+      <label for="name">Your name</label>
+      <input id="name" name="name" type="text" placeholder="Ada Lovelace" />
+
+      <label for="plan">Plan</label>
+      <select id="plan">
+        <option value="free">Free</option>
+        <option value="pro">Pro</option>
+      </select>
+
+      <label><input type="checkbox" id="agree" /> I agree to the terms</label>
+
+      <button type="submit" id="submit">Say hello</button>
+    </form>
+
+    <div id="result" role="status"></div>
+
+    <button id="reveal">Reveal (slow)</button>
+    <div id="editor" contenteditable="true">Edit me</div>
+    <button id="counter">Clicked 0</button>
+
+    <script>
+      const form = document.getElementById('form');
+      const result = document.getElementById('result');
+      form.addEventListener('submit', (e) => {
+        e.preventDefault();
+        const name = document.getElementById('name').value || '(nobody)';
+        const plan = document.getElementById('plan').value;
+        const agreed = document.getElementById('agree').checked;
+        result.textContent = `hello ${name} (${plan}${agreed ? ', agreed' : ''})`;
+      });
+      document.getElementById('counter').addEventListener('click', function () {
+        const n = Number(this.dataset.n || 0) + 1;
+        this.dataset.n = String(n);
+        this.textContent = `Clicked ${n}`;
+      });
+      document.getElementById('reveal').addEventListener('click', () => {
+        setTimeout(() => {
+          if (document.getElementById('later')) return;
+          const d = document.createElement('div');
+          d.id = 'later';
+          d.textContent = 'Surprise appeared';
+          document.body.append(d);
+        }, 900);
+      });
+    </script>
+  </body>
+</html>
