@@ -712,18 +712,13 @@ const methods: Record<string, Method> = {
     const tab = await resolveTab(p, { page: false });
     await assertAllowed(tab);
     // captureVisibleTab only sees the *active* tab of a window, so the tab is
-    // borrowed for the length of the capture and then handed back to whatever
-    // the user was reading. Window focus is left alone unless it was lost.
+    // borrowed for the length of the capture and handed straight back to
+    // whatever the user was reading. The window is deliberately NOT focused:
+    // pulling the whole browser in front of the terminal on every screenshot is
+    // the single biggest way an agent steals focus.
     const [previous] = await chrome.tabs.query({ windowId: tab.windowId, active: true });
     const borrowed = previous?.id !== tab.id;
     if (borrowed) await chrome.tabs.update(tab.id!, { active: true });
-    if (borrowed && !(await chrome.windows.get(tab.windowId)).focused) {
-      try {
-        await chrome.windows.update(tab.windowId, { focused: true });
-      } catch {
-        /* window may be gone */
-      }
-    }
     await sleep(p.delayMs ?? 250);
     try {
       const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });

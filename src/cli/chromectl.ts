@@ -40,7 +40,7 @@ interface CommandContext {
   name: string;
 }
 
-type Target = { ref?: string; selector?: string; text?: string };
+type Target = { ref?: string; selector?: string; text?: string; index?: number };
 
 /* ------------------------------------------------------------------ */
 /* daemon plumbing                                                     */
@@ -135,6 +135,7 @@ const BOOLEAN_FLAGS = new Set([
   'quiet',
   'background',
   'active',
+  'index',
 ]);
 
 function parse(argv: string[]): { args: string[]; flags: Flags } {
@@ -169,18 +170,19 @@ function parse(argv: string[]): { args: string[]; flags: Flags } {
 
 /** bare number -> ref, css=/#./[/> -> selector, text= -> text, else text */
 function target(spec: string | undefined, flags: Flags = {}): Target {
+  const idx = flags.index != null ? { index: Number(flags.index) } : {};
   if (flags.ref != null) return { ref: String(flags.ref) };
-  if (flags.selector) return { selector: String(flags.selector) };
-  if (flags.text) return { text: String(flags.text) };
+  if (flags.selector) return { selector: String(flags.selector), ...idx };
+  if (flags.text) return { text: String(flags.text), ...idx };
   if (spec == null) return {};
   const s = String(spec);
   if (/^\[?\d+\]?$/.test(s.trim())) return { ref: s.replace(/[[\]]/g, '') };
   if (s.startsWith('ref=')) return { ref: s.slice(4) };
-  if (s.startsWith('css=')) return { selector: s.slice(4) };
-  if (s.startsWith('selector=')) return { selector: s.slice(9) };
-  if (s.startsWith('text=')) return { text: s.slice(5) };
-  if (/^[#.[*>]/.test(s) || /^[a-z]+\[/.test(s)) return { selector: s };
-  return { text: s };
+  if (s.startsWith('css=')) return { selector: s.slice(4), ...idx };
+  if (s.startsWith('selector=')) return { selector: s.slice(9), ...idx };
+  if (s.startsWith('text=')) return { text: s.slice(5), ...idx };
+  if (/^[#.[*>]/.test(s) || /^[a-z]+\[/.test(s)) return { selector: s, ...idx };
+  return { text: s, ...idx };
 }
 
 /* ------------------------------------------------------------------ */
