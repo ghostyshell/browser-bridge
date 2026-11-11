@@ -29,6 +29,10 @@ check() {
 
 cleanup() {
   [ -n "${SERVER_PID:-}" ] && kill "$SERVER_PID" 2>/dev/null
+  # The throwaway browser must not outlive the run: the daemon pins the first
+  # connected client, so a leftover test Chrome silently takes every later
+  # command (and reports its own empty permission storage).
+  pkill -f "user-data-dir=${PROFILE}" 2>/dev/null
 }
 trap cleanup EXIT
 
