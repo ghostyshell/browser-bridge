@@ -20,7 +20,7 @@ import type {
   TabDescriptor,
 } from '../shared/types';
 
-const VERSION = '1.4.1';
+const VERSION = '1.4.2';
 const PORT = 8737;
 const WS_URL = `ws://127.0.0.1:${PORT}/ws`;
 const GROUP_TITLE = 'Agent';
@@ -923,7 +923,11 @@ const methods: Record<string, Method> = {
   async 'page.click'(p: ActionParams = {}) {
     const tab = await resolveTab(p, { page: false });
     await assertAllowed(tab);
-    if (p.viaCdp) {
+    // CDP is the default path: trusted input, no activation. --click-only keeps
+    // the in-page synthetic path (when only one event type should fire) and
+    // --no-cdp forces it entirely.
+    const wantCdp = !p.noCdp && !p.clickOnly;
+    if (wantCdp) {
       try {
         return await cdpClick(tab.id!, p);
       } catch {
@@ -936,6 +940,7 @@ const methods: Record<string, Method> = {
   async 'page.type'(p: ActionParams = {}) {
     const tab = await resolveTab(p, { page: false });
     await assertAllowed(tab);
+    if (p.noCdp) return callPage(tab, 'type', p);
     try {
       return await cdpType(tab.id!, p);
     } catch {
@@ -971,6 +976,7 @@ const methods: Record<string, Method> = {
   async 'page.scroll'(p: ActionParams = {}) {
     const tab = await resolveTab(p, { page: false });
     await assertAllowed(tab);
+    if (p.noCdp) return callPage(tab, 'scroll', p);
     try {
       return await cdpScroll(tab.id!, p);
     } catch {
@@ -981,6 +987,7 @@ const methods: Record<string, Method> = {
   async 'page.hover'(p: ActionParams = {}) {
     const tab = await resolveTab(p, { page: false });
     await assertAllowed(tab);
+    if (p.noCdp) return callPage(tab, 'hover', p);
     try {
       return await cdpHover(tab.id!, p);
     } catch {
@@ -1025,7 +1032,7 @@ const methods: Record<string, Method> = {
     if (!p.expression) throw fail('bad_request', 'page.eval needs an expression');
     // The debugger's Runtime.evaluate is not subject to the page's Trusted
     // Types or CSP, so it works on Google properties where injected eval fails.
-    try {
+    if (!p.noCdp) try {
       const res = (await cdp(tab.id!, 'Runtime.evaluate', {
         expression: String(p.expression),
         returnByValue: true,

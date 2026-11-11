@@ -148,6 +148,8 @@ export interface PageParams {
   clickOnly?: boolean;
   /** Send the click through CDP as real input events. */
   viaCdp?: boolean;
+  /** Force the content-script path instead of the debugger. */
+  noCdp?: boolean;
 }
 
 export interface Envelope<T = unknown> {
