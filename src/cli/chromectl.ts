@@ -137,6 +137,7 @@ const BOOLEAN_FLAGS = new Set([
   'active',
   'index',
   'click-only',
+  'cdp',
 ]);
 
 function parse(argv: string[]): { args: string[]; flags: Flags } {
@@ -397,6 +398,7 @@ const commands: Record<string, (ctx: CommandContext) => Promise<void>> = {
       ...tabParam(flags),
       ...t,
       clickOnly: !!flags['click-only'],
+      viaCdp: !!flags.cdp,
     });
     if (flags.json) return out(JSON.stringify(r, null, 2));
     if (r.clicked) out(`clicked ${r.clicked.role} "${r.clicked.name}"${r.navigated ? '  -> navigated' : ''}`);
@@ -598,7 +600,7 @@ const commands: Record<string, (ctx: CommandContext) => Promise<void>> = {
   chromectl text                    visible text of the page
   chromectl links                   every visible link
   chromectl query <css>             structured rows: text, href, value, class
-  chromectl click <ref|css=|text=>   click something  [--click-only]
+  chromectl click <ref|css=|text=>   click something  [--cdp] [--click-only]
   chromectl type <ref> <text>       type into a field  [--submit] [--slow] [--no-clear]
   chromectl key <combo>             key press: Enter, Escape, Meta+a, Shift+Tab
   chromectl scroll <up|down|top|bottom>   or --ref N

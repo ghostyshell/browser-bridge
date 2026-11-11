@@ -20,7 +20,7 @@ import type {
   TabDescriptor,
 } from '../shared/types';
 
-const VERSION = '1.2.0';
+const VERSION = '1.3.0';
 const PORT = 8737;
 const WS_URL = `ws://127.0.0.1:${PORT}/ws`;
 const GROUP_TITLE = 'Agent';
@@ -401,6 +401,62 @@ async function callPage<T>(tab: chrome.tabs.Tab, action: PageAction, params: Act
   }
 }
 
+/** JS expression that resolves a click target from the same params the content
+ *  script takes, so refs, selectors and text search behave identically. */
+function elementExpression(p: ActionParams): string {
+  if (p.ref !== undefined && p.ref !== null && p.ref !== '') {
+    return `document.querySelector('[data-bb-ref="${String(p.ref).replace(/"/g, '\\"')}"]')`;
+  }
+  if (p.selector) {
+    const sel = JSON.stringify(p.selector);
+    return `document.querySelectorAll(${sel})[${Number(p.index) || 0}]`;
+  }
+  if (p.text) {
+    const needle = JSON.stringify(String(p.text).toLowerCase());
+    return `[...document.querySelectorAll('a,button,[role=button],[role=link],[role=menuitem],[role=option],label,span')]
+      .find((el) => (el.innerText || el.getAttribute('aria-label') || '').trim().toLowerCase().includes(${needle}))`;
+  }
+  return 'null';
+}
+
+/**
+ * Click through the debugger: real Input.dispatchMouseEvent presses, which
+ * Material widgets honour where in-page synthetic events are ignored (menus
+ * close on mousedown, mat-option needs a trusted press).
+ */
+async function cdpClick(tabId: number, p: ActionParams): Promise<Record<string, unknown>> {
+  const target = { tabId };
+  await chrome.debugger.attach(target, '1.3');
+  try {
+    const res = (await chrome.debugger.sendCommand(target, 'Runtime.evaluate', {
+      expression: `(() => {
+        const el = ${elementExpression(p)};
+        if (!el) return null;
+        el.scrollIntoView({ block: 'center', inline: 'center' });
+        const r = el.getBoundingClientRect();
+        return { x: r.left + r.width / 2, y: r.top + r.height / 2, name: (el.innerText || el.getAttribute('aria-label') || '').trim().slice(0, 80) };
+      })()`,
+      returnByValue: true,
+    })) as { result?: { value?: { x: number; y: number; name: string } } };
+    const box = res.result?.value;
+    if (!box) throw new Error('element not found');
+    for (const type of ['mousePressed', 'mouseReleased'] as const) {
+      await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
+        type,
+        x: box.x,
+        y: box.y,
+        button: 'left',
+        buttons: type === 'mousePressed' ? 1 : 0,
+        clickCount: 1,
+      });
+    }
+    await sleep(p.waitMs ?? 250);
+    return { clicked: { role: 'element', name: box.name }, url: '', navigated: false, viaCdp: true };
+  } finally {
+    await chrome.debugger.detach(target).catch(() => undefined);
+  }
+}
+
 /** One-shot CDP screenshot of a tab, attached and detached per capture. */
 async function cdpScreenshot(tabId: number): Promise<string> {
   const target = { tabId };
@@ -638,7 +694,15 @@ const methods: Record<string, Method> = {
   },
 
   async 'page.click'(p: ActionParams = {}) {
-    const tab = await resolveTab(p);
+    const tab = await resolveTab(p, { page: false });
+    await assertAllowed(tab);
+    if (p.viaCdp) {
+      try {
+        return await cdpClick(tab.id!, p);
+      } catch {
+        // debugger refused (devtools open, restricted page): fall back.
+      }
+    }
     return callPage(tab, 'click', p);
   },
 

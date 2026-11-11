@@ -146,6 +146,8 @@ export interface PageParams {
   /** Dispatch only a click event, no pointerdown/mousedown. Materials menus
    *  close on mousedown, which detaches the item before the click fires. */
   clickOnly?: boolean;
+  /** Send the click through CDP as real input events. */
+  viaCdp?: boolean;
 }
 
 export interface Envelope<T = unknown> {
