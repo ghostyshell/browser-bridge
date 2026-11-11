@@ -351,6 +351,18 @@ declare global {
       detail: 1,
     };
     const beforeUrl = location.href;
+
+    if (p.clickOnly) {
+      el.dispatchEvent(new MouseEvent('click', { ...base, buttons: 0 }));
+      await sleep(p.waitMs ?? 300);
+      return {
+        clicked: describeEl(el),
+        url: location.href,
+        navigated: location.href !== beforeUrl,
+        title: document.title,
+      };
+    }
+
     try {
       el.dispatchEvent(new PointerEvent('pointerover', { ...base, buttons: 0, pointerId: 1, pointerType: 'mouse' }));
       el.dispatchEvent(new MouseEvent('mouseover', { ...base, buttons: 0 }));

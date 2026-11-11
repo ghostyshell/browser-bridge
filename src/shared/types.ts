@@ -143,6 +143,9 @@ export interface PageParams {
   submit?: boolean;
   slow?: number;
   waitMs?: number;
+  /** Dispatch only a click event, no pointerdown/mousedown. Materials menus
+   *  close on mousedown, which detaches the item before the click fires. */
+  clickOnly?: boolean;
 }
 
 export interface Envelope<T = unknown> {
