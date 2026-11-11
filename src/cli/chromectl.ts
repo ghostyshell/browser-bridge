@@ -512,7 +512,12 @@ const commands: Record<string, (ctx: CommandContext) => Promise<void>> = {
   async upload({ args, flags }) {
     const [selector, file] = args;
     if (!selector || !file) die('usage: chromectl upload <css file input> <path>');
-    const r = await rpc<{ uploaded: string }>('page.upload', { ...tabParam(flags), selector, file: path.resolve(file) });
+    const r = await rpc<{ uploaded: string }>('page.upload', {
+      ...tabParam(flags),
+      selector,
+      index: flags.index != null ? Number(flags.index) : 0,
+      file: path.resolve(file),
+    });
     if (flags.json) return out(JSON.stringify(r, null, 2));
     out(`uploaded ${r.uploaded}`);
   },

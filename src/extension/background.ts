@@ -20,7 +20,7 @@ import type {
   TabDescriptor,
 } from '../shared/types';
 
-const VERSION = '1.5.1';
+const VERSION = '1.5.2';
 const PORT = 8737;
 const WS_URL = `ws://127.0.0.1:${PORT}/ws`;
 const GROUP_TITLE = 'Agent';
@@ -773,12 +773,13 @@ async function cdpHover(tabId: number, p: ActionParams): Promise<Record<string, 
 async function cdpUpload(tabId: number, p: ActionParams): Promise<Record<string, unknown>> {
   if (!p.selector || !p.file) throw new Error('upload needs a selector and a path');
   const doc = (await cdp(tabId, 'DOM.getDocument', { depth: -1 })) as { root: { nodeId: number } };
-  const found = (await cdp(tabId, 'DOM.querySelector', {
+  const list = (await cdp(tabId, 'DOM.querySelectorAll', {
     nodeId: doc.root.nodeId,
     selector: p.selector,
-  })) as { nodeId: number };
-  if (!found?.nodeId) throw new Error(`no file input matching ${p.selector}`);
-  await cdp(tabId, 'DOM.setFileInputFiles', { nodeId: found.nodeId, files: [p.file] }, { raceAck: false });
+  })) as { nodeIds: number[] };
+  const nodeId = list?.nodeIds?.[Number(p.index) || 0];
+  if (!nodeId) throw new Error(`no file input matching ${p.selector}`);
+  await cdp(tabId, 'DOM.setFileInputFiles', { nodeId, files: [p.file] }, { raceAck: false });
   await cdp(tabId, 'Runtime.evaluate', {
     expression: `(() => { const el = document.querySelector(${JSON.stringify(p.selector)}); if (el) { el.dispatchEvent(new Event('input', {bubbles:true})); el.dispatchEvent(new Event('change', {bubbles:true})); } })()`,
   });
