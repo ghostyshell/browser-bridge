@@ -9,42 +9,69 @@
  * the user has approved in the extension popup.
  */
 
-const VERSION = '1.0.0';
+import type {
+  Envelope,
+  NavigationResult,
+  PageAction,
+  PageParams,
+  Settings,
+  SnapshotResult,
+  StatusResult,
+  TabDescriptor,
+} from '../shared/types';
+
+const VERSION = '1.1.0';
 const PORT = 8737;
 const WS_URL = `ws://127.0.0.1:${PORT}/ws`;
 const GROUP_TITLE = 'Agent';
-const GROUP_COLOR = 'purple';
+const GROUP_COLOR = 'purple' as chrome.tabGroups.ColorEnum & string;
 
-/** @type {WebSocket|null} */
-let socket = null;
+let socket: WebSocket | null = null;
 let connected = false;
 let backoffMs = 700;
 let inflight = 0;
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 class BridgeError extends Error {
-  constructor(code, message) {
+  code: string;
+
+  constructor(code: string, message: string) {
     super(message);
     this.code = code;
   }
 }
-const fail = (code, message) => new BridgeError(code, message);
+
+const fail = (code: string, message: string): BridgeError => new BridgeError(code, message);
+
+type ActionParams = PageParams & {
+  tabId?: number;
+  active?: boolean;
+  hard?: boolean;
+  all?: boolean;
+  expression?: string;
+  origin?: string;
+  url?: string;
+  timeout?: number;
+  delayMs?: number;
+};
+
+type Method = (params: ActionParams) => Promise<unknown>;
 
 /* ------------------------------------------------------------------ */
 /* settings + policy                                                   */
 /* ------------------------------------------------------------------ */
 
-async function getSettings() {
-  const s = await chrome.storage.local.get({
+async function getSettings(): Promise<Settings> {
+  return (await chrome.storage.local.get({
     allowedOrigins: [],
     autoAllow: false,
     pendingOrigin: null,
-  });
-  return s;
+  })) as Settings;
 }
 
-function originOf(url) {
+function originOf(url: string): string | null {
   try {
     const u = new URL(url);
     if (!u.origin || u.origin === 'null') return null;
@@ -54,7 +81,7 @@ function originOf(url) {
   }
 }
 
-function originAllowed(origin, list) {
+function originAllowed(origin: string | null, list: string[]): boolean {
   if (!origin) return false;
   return list.some((entry) => {
     if (entry === origin) return true;
@@ -75,7 +102,7 @@ const INTERNAL_URL = /^(chrome|chrome-extension|edge|about|devtools|view-source)
  * The single permission gate. Called before the agent touches a page and
  * before it navigates somewhere new, so an unapproved site is never loaded.
  */
-async function requireOrigin(url, { tabId = null } = {}) {
+async function requireOrigin(url: string | undefined, { tabId = null }: { tabId?: number | null } = {}): Promise<void> {
   if (!url || url === 'about:blank' || INTERNAL_URL.test(url)) return;
   let protocol = '';
   try {
@@ -93,9 +120,7 @@ async function requireOrigin(url, { tabId = null } = {}) {
   const { allowedOrigins, autoAllow } = await getSettings();
   if (autoAllow || originAllowed(origin, allowedOrigins)) return;
 
-  await chrome.storage.local.set({
-    pendingOrigin: { origin, url, tabId, at: Date.now() },
-  });
+  await chrome.storage.local.set({ pendingOrigin: { origin, url, tabId, at: Date.now() } });
   await paintBadge();
   throw fail(
     'origin_not_allowed',
@@ -103,20 +128,24 @@ async function requireOrigin(url, { tabId = null } = {}) {
   );
 }
 
-const assertAllowed = (tab) => requireOrigin(tab?.url || tab?.pendingUrl, { tabId: tab?.id ?? null });
+async function assertAllowed(tab: chrome.tabs.Tab): Promise<void> {
+  return requireOrigin(tab?.url || tab?.pendingUrl, { tabId: tab?.id ?? null });
+}
 
 /* ------------------------------------------------------------------ */
 /* tab group workspace                                                 */
 /* ------------------------------------------------------------------ */
 
+type GroupMap = Record<number, number>;
+
 // Group ids live in local storage so the workspace survives an extension
 // reload or a browser restart (Chrome restores tab groups with the session).
-async function loadGroups() {
+async function loadGroups(): Promise<GroupMap> {
   const { agentGroups = {} } = await chrome.storage.local.get('agentGroups');
-  return agentGroups;
+  return agentGroups as GroupMap;
 }
 
-async function saveGroups(groups) {
+async function saveGroups(groups: GroupMap): Promise<void> {
   await chrome.storage.local.set({ agentGroups: groups });
 }
 
@@ -125,12 +154,12 @@ async function saveGroups(groups) {
  * but a purple group named "Agent" still exists, adopt it again instead of
  * leaving the user with an orphaned group.
  */
-async function recoverGroups() {
+async function recoverGroups(): Promise<GroupMap> {
   try {
     const found = await chrome.tabGroups.query({ title: GROUP_TITLE });
     const matches = found.filter((g) => g.color === GROUP_COLOR);
     if (!matches.length) return {};
-    const groups = {};
+    const groups: GroupMap = {};
     for (const g of matches) groups[g.windowId] = g.id;
     await saveGroups(groups);
     return groups;
@@ -140,10 +169,10 @@ async function recoverGroups() {
 }
 
 /** Returns the live group id for a window, pruning dead ids. */
-async function groupForWindow(windowId) {
-  let groups = await loadGroups();
-  if (!Object.keys(groups).length) groups = await recoverGroups();
-  const gid = groups[windowId];
+async function groupForWindow(windowId: number): Promise<number | null> {
+  const groups = await loadGroups();
+  const resolved = Object.keys(groups).length ? groups : await recoverGroups();
+  const gid = resolved[windowId];
   if (gid == null) return null;
   try {
     const g = await chrome.tabGroups.get(gid);
@@ -151,15 +180,15 @@ async function groupForWindow(windowId) {
   } catch {
     /* group closed */
   }
-  delete groups[windowId];
-  await saveGroups(groups);
+  delete resolved[windowId];
+  await saveGroups(resolved);
   return null;
 }
 
-async function agentTabs() {
+async function agentTabs(): Promise<chrome.tabs.Tab[]> {
   let groups = await loadGroups();
   if (!Object.keys(groups).length) groups = await recoverGroups();
-  const out = [];
+  const out: chrome.tabs.Tab[] = [];
   let dirty = false;
   for (const [winId, gid] of Object.entries(groups)) {
     try {
@@ -170,12 +199,12 @@ async function agentTabs() {
         try {
           await chrome.tabGroups.get(gid);
         } catch {
-          delete groups[winId];
+          delete groups[Number(winId)];
           dirty = true;
         }
       }
     } catch {
-      delete groups[winId];
+      delete groups[Number(winId)];
       dirty = true;
     }
   }
@@ -184,15 +213,15 @@ async function agentTabs() {
   return out;
 }
 
-async function isAgentTab(tab) {
+async function isAgentTab(tab: chrome.tabs.Tab): Promise<boolean> {
   if (!tab || tab.groupId == null || tab.groupId < 0) return false;
   const groups = await loadGroups();
   return Object.values(groups).includes(tab.groupId);
 }
 
-function describeTab(t) {
+function describeTab(t: chrome.tabs.Tab): TabDescriptor {
   return {
-    tabId: t.id,
+    tabId: t.id ?? -1,
     windowId: t.windowId,
     groupId: t.groupId,
     url: t.url || t.pendingUrl || '',
@@ -203,12 +232,12 @@ function describeTab(t) {
   };
 }
 
-async function waitForLoad(tabId, timeoutMs = 20000) {
+async function waitForLoad(tabId: number, timeoutMs = 20_000): Promise<chrome.tabs.Tab | null> {
   const start = Date.now();
   // Give the navigation a moment to start before trusting status=complete.
   await sleep(120);
   while (Date.now() - start < timeoutMs) {
-    let t;
+    let t: chrome.tabs.Tab;
     try {
       t = await chrome.tabs.get(tabId);
     } catch {
@@ -224,9 +253,12 @@ async function waitForLoad(tabId, timeoutMs = 20000) {
   }
 }
 
-async function resolveTab(params = {}, { page = true, requireAgent = true } = {}) {
-  let tab = null;
-  if (params.tabId != null && params.tabId !== '') {
+async function resolveTab(
+  params: ActionParams = {},
+  { page = true, requireAgent = true } = {},
+): Promise<chrome.tabs.Tab> {
+  let tab: chrome.tabs.Tab;
+  if (params.tabId != null && (params.tabId as unknown) !== '') {
     try {
       tab = await chrome.tabs.get(Number(params.tabId));
     } catch {
@@ -241,10 +273,8 @@ async function resolveTab(params = {}, { page = true, requireAgent = true } = {}
     }
   } else {
     const tabs = await agentTabs();
-    if (!tabs.length) {
-      throw fail('no_agent_tab', 'No agent tab is open yet. Run "chromectl open <url>" first.');
-    }
-    tab = tabs.find((t) => t.active) || tabs[0];
+    if (!tabs.length) throw fail('no_agent_tab', 'No agent tab is open yet. Run "chromectl open <url>" first.');
+    tab = tabs.find((t) => t.active) || tabs[0]!;
   }
   if (page) await assertAllowed(tab);
   return tab;
@@ -254,9 +284,9 @@ async function resolveTab(params = {}, { page = true, requireAgent = true } = {}
 /* content script plumbing                                             */
 /* ------------------------------------------------------------------ */
 
-async function ensureInjected(tabId) {
+async function ensureInjected(tabId: number): Promise<void> {
   try {
-    const res = await chrome.tabs.sendMessage(tabId, { __bb: 1, action: 'ping' });
+    const res = (await chrome.tabs.sendMessage(tabId, { __bb: 1, action: 'ping' })) as { ok?: boolean } | undefined;
     if (res && res.ok) return;
   } catch {
     /* not injected yet, or no listener */
@@ -266,37 +296,37 @@ async function ensureInjected(tabId) {
   } catch (e) {
     throw fail(
       'restricted_page',
-      `Chrome does not let extensions script this page (${e.message}). Open a normal http(s) page instead.`,
+      `Chrome does not let extensions script this page (${(e as Error).message}). Open a normal http(s) page instead.`,
     );
   }
 }
 
 /** Reads the live URL from the page itself (chrome.tabs.get can report a
  *  stale snapshot right after a navigation starts). */
-async function liveUrl(tabId) {
+async function liveUrl(tabId: number): Promise<string | null> {
   try {
     const frames = await chrome.scripting.executeScript({ target: { tabId }, func: () => location.href });
-    return frames?.[0]?.result || null;
+    return (frames?.[0]?.result as string | undefined) || null;
   } catch {
     return null;
   }
 }
 
 /** Detects a mid-flight navigation so a lost response is not reported as an error. */
-async function navigationResult(tab) {
+async function navigationResult(tab: chrome.tabs.Tab): Promise<NavigationResult | null> {
   await sleep(250);
   for (let i = 0; i < 4; i++) {
-    const live = await liveUrl(tab.id);
-    const now = await chrome.tabs.get(tab.id).catch(() => null);
+    const live = await liveUrl(tab.id!);
+    const now = await chrome.tabs.get(tab.id!).catch(() => null);
     const url = live || now?.url || '';
     const moved = !!url && !!tab.url && url !== tab.url;
     if (moved || now?.status === 'loading') {
-      if (now?.status === 'loading') await waitForLoad(tab.id, 10000);
-      const final = await chrome.tabs.get(tab.id).catch(() => now);
+      if (now?.status === 'loading') await waitForLoad(tab.id!, 10_000);
+      const final = await chrome.tabs.get(tab.id!).catch(() => now);
       return {
         navigated: true,
-        url: (await liveUrl(tab.id)) || final?.url || url,
-        title: final?.title || tab.title,
+        url: (await liveUrl(tab.id!)) || final?.url || url,
+        title: final?.title || tab.title || '',
         note: 'The page navigated while the action ran; the action result was not readable. Take a fresh snapshot.',
       };
     }
@@ -305,25 +335,25 @@ async function navigationResult(tab) {
   return null;
 }
 
-const NAV_ACTIONS = new Set(['click', 'key', 'type', 'select', 'hover']);
+const NAV_ACTIONS = new Set<PageAction>(['click', 'key', 'type', 'select', 'hover']);
 
-async function callPage(tab, action, params = {}) {
-  const unwrap = (res) => {
+async function callPage<T>(tab: chrome.tabs.Tab, action: PageAction, params: ActionParams = {}): Promise<T | NavigationResult> {
+  const unwrap = (res: Envelope<unknown> | undefined): T => {
     if (!res) throw fail('no_response', 'The page did not respond (it may be navigating). Retry.');
     if (!res.ok) throw fail(res.code || 'page_error', res.error || 'Page action failed');
-    return res.result;
+    return res.result as T;
   };
 
-  await ensureInjected(tab.id);
+  await ensureInjected(tab.id!);
   try {
-    return unwrap(await chrome.tabs.sendMessage(tab.id, { __bb: 1, action, params }));
+    return unwrap((await chrome.tabs.sendMessage(tab.id!, { __bb: 1, action, params })) as Envelope<unknown>);
   } catch (e) {
     // The page navigated (or reloaded) out from under the message.
     const nav = await navigationResult(tab);
     if (nav) return nav;
-    await ensureInjected(tab.id);
+    await ensureInjected(tab.id!);
     try {
-      return unwrap(await chrome.tabs.sendMessage(tab.id, { __bb: 1, action, params }));
+      return unwrap((await chrome.tabs.sendMessage(tab.id!, { __bb: 1, action, params })) as Envelope<unknown>);
     } catch (e2) {
       const nav2 = await navigationResult(tab);
       if (nav2) return nav2;
@@ -331,16 +361,16 @@ async function callPage(tab, action, params = {}) {
       // context. Report that softly so the agent re-reads the page instead of
       // chasing a phantom error.
       if (NAV_ACTIONS.has(action)) {
-        const now = await chrome.tabs.get(tab.id).catch(() => null);
+        const now = await chrome.tabs.get(tab.id!).catch(() => null);
         return {
           navigated: !!(now && tab.url && now.url !== tab.url),
           uncertain: true,
-          url: now?.url || tab.url,
-          title: now?.title || tab.title,
+          url: now?.url || tab.url || '',
+          title: now?.title || tab.title || '',
           note: 'The page reloaded or navigated while the action ran and the result was lost. Take a fresh snapshot to confirm what happened.',
         };
       }
-      throw fail('no_response', `The page did not respond to ${action} (${e2.message || e2}). Take a fresh snapshot and retry.`);
+      throw fail('no_response', `The page did not respond to ${action} (${(e2 as Error).message || e2}). Take a fresh snapshot and retry.`);
     }
   }
 }
@@ -349,8 +379,8 @@ async function callPage(tab, action, params = {}) {
 /* methods                                                             */
 /* ------------------------------------------------------------------ */
 
-const methods = {
-  async status() {
+const methods: Record<string, Method> = {
+  async status(): Promise<StatusResult> {
     const { allowedOrigins, autoAllow, pendingOrigin } = await getSettings();
     const groups = await loadGroups();
     const tabs = await agentTabs();
@@ -367,13 +397,14 @@ const methods = {
 
   async 'group.reset'() {
     const groups = await loadGroups();
-    const byWindow = new Map();
+    const byWindow = new Map<number, number[]>();
     for (const gid of Object.values(groups)) {
       try {
         const tabs = await chrome.tabs.query({ groupId: gid });
         for (const t of tabs) {
+          if (t.id == null) continue;
           if (!byWindow.has(t.windowId)) byWindow.set(t.windowId, []);
-          byWindow.get(t.windowId).push(t.id);
+          byWindow.get(t.windowId)!.push(t.id);
         }
       } catch {
         /* group gone */
@@ -387,11 +418,13 @@ const methods = {
       try {
         if (tabIds.length >= total) {
           // Never leave a window empty: Chrome would close it under the user.
-          const keep = tabIds[0];
+          const keep = tabIds[0]!;
           await chrome.tabs.update(keep, { url: 'about:blank' });
           try {
             await chrome.tabs.ungroup(keep);
-          } catch {}
+          } catch {
+            /* already ungrouped */
+          }
           const rest = tabIds.slice(1);
           if (rest.length) await chrome.tabs.remove(rest);
           closed += rest.length;
@@ -399,44 +432,45 @@ const methods = {
           await chrome.tabs.remove(tabIds);
           closed += tabIds.length;
         }
-      } catch (e) {
+      } catch {
         try {
           await chrome.tabs.ungroup(tabIds);
-        } catch {}
+        } catch {
+          /* nothing to ungroup */
+        }
       }
     }
     await saveGroups({});
     return { closed };
   },
 
-  async 'tab.open'(p = {}) {
+  async 'tab.open'(p: ActionParams = {}) {
     const url = p.url || 'about:blank';
     await requireOrigin(url);
     const win = await chrome.windows.getLastFocused({ windowTypes: ['normal'] });
-    let gid = await groupForWindow(win.id);
-    const tab = await chrome.tabs.create({ url, windowId: win.id, active: p.active !== false });
+    let gid = win.id == null ? null : await groupForWindow(win.id);
+    // Background by default: the user keeps the tab they were reading.
+    const tab = await chrome.tabs.create({ url, windowId: win.id, active: p.active === true });
     if (gid != null) {
       try {
-        await chrome.tabs.group({ tabIds: [tab.id], groupId: gid });
+        await chrome.tabs.group({ tabIds: [tab.id!], groupId: gid });
       } catch {
         gid = null;
       }
     }
     if (gid == null) {
-      gid = await chrome.tabs.group({ tabIds: [tab.id], createProperties: { windowId: win.id } });
+      gid = await chrome.tabs.group({ tabIds: [tab.id!], createProperties: { windowId: win.id } });
       try {
-        await chrome.tabGroups.update(gid, {
-          title: GROUP_TITLE,
-          color: GROUP_COLOR,
-          collapsed: false,
-        });
-      } catch {}
+        await chrome.tabGroups.update(gid, { title: GROUP_TITLE, color: GROUP_COLOR, collapsed: false });
+      } catch {
+        /* group may already be gone */
+      }
       const groups = await loadGroups();
-      groups[win.id] = gid;
+      groups[win.id!] = gid;
       await saveGroups(groups);
     }
-    const loaded = await waitForLoad(tab.id, p.timeout ?? 20000);
-    let finalTab = loaded || (await chrome.tabs.get(tab.id).catch(() => tab));
+    const loaded = await waitForLoad(tab.id!, p.timeout ?? 20_000);
+    const finalTab = loaded || (await chrome.tabs.get(tab.id!).catch(() => tab));
     if (p.url && p.url !== 'about:blank') {
       // A blocked origin is reported before the agent starts reading the page.
       await assertAllowed(finalTab);
@@ -444,39 +478,46 @@ const methods = {
     return { ...describeTab(finalTab), groupId: gid };
   },
 
-  async 'tab.list'(p = {}) {
+  async 'tab.list'(p: ActionParams = {}) {
     const tabs = await agentTabs();
-    return {
-      tabs: (p.all ? await chrome.tabs.query({}) : tabs).map(describeTab),
-    };
+    return { tabs: (p.all ? await chrome.tabs.query({}) : tabs).map(describeTab) };
   },
 
-  async 'tab.activate'(p) {
+  async 'tab.activate'(p: ActionParams = {}) {
     const tab = await resolveTab(p, { page: false });
-    await chrome.tabs.update(tab.id, { active: true });
+    await chrome.tabs.update(tab.id!, { active: true });
     await chrome.windows.update(tab.windowId, { focused: true });
-    return describeTab(await chrome.tabs.get(tab.id));
+    // Keep the group visible so the user can see what the agent is doing.
+    try {
+      const gid = await groupForWindow(tab.windowId);
+      if (gid != null) await chrome.tabGroups.update(gid, { collapsed: false });
+    } catch {
+      /* group may be gone */
+    }
+    return describeTab(await chrome.tabs.get(tab.id!));
   },
 
-  async 'tab.close'(p) {
+  async 'tab.close'(p: ActionParams = {}) {
     const tab = await resolveTab(p, { page: false });
     const total = (await chrome.tabs.query({ windowId: tab.windowId })).length;
     if (total <= 1) {
       // Closing the last tab would close the user's window. Blank it instead.
-      await chrome.tabs.update(tab.id, { url: 'about:blank' });
+      await chrome.tabs.update(tab.id!, { url: 'about:blank' });
       try {
-        await chrome.tabs.ungroup(tab.id);
-      } catch {}
+        await chrome.tabs.ungroup(tab.id!);
+      } catch {
+        /* already ungrouped */
+      }
       return { closed: null, blanked: tab.id };
     }
-    await chrome.tabs.remove(tab.id);
+    await chrome.tabs.remove(tab.id!);
     return { closed: tab.id };
   },
 
   /** Pulls a tab the user already has open into the agent group. */
-  async 'tab.adopt'(p = {}) {
-    let tab;
-    if (p.tabId != null && p.tabId !== '') {
+  async 'tab.adopt'(p: ActionParams = {}) {
+    let tab: chrome.tabs.Tab | undefined;
+    if (p.tabId != null && (p.tabId as unknown) !== '') {
       tab = await chrome.tabs.get(Number(p.tabId));
     } else if (p.url) {
       const [found] = await chrome.tabs.query({ url: p.url });
@@ -488,153 +529,157 @@ const methods = {
     }
     if (tab.groupId != null && (await isAgentTab(tab))) return describeTab(tab);
 
-    await requireOrigin(tab.url || tab.pendingUrl, { tabId: tab.id });
+    await requireOrigin(tab.url || tab.pendingUrl, { tabId: tab.id ?? null });
 
     const win = await chrome.windows.get(tab.windowId);
     if (win.type !== 'normal') throw fail('bad_window', 'Only normal browser windows can host the agent group.');
 
     let gid = await groupForWindow(tab.windowId);
     if (gid != null) {
-      await chrome.tabs.group({ tabIds: [tab.id], groupId: gid });
+      await chrome.tabs.group({ tabIds: [tab.id!], groupId: gid });
     } else {
-      gid = await chrome.tabs.group({ tabIds: [tab.id], createProperties: { windowId: tab.windowId } });
+      gid = await chrome.tabs.group({ tabIds: [tab.id!], createProperties: { windowId: tab.windowId } });
       try {
         await chrome.tabGroups.update(gid, { title: GROUP_TITLE, color: GROUP_COLOR, collapsed: false });
-      } catch {}
+      } catch {
+        /* group may already be gone */
+      }
       const groups = await loadGroups();
       groups[tab.windowId] = gid;
       await saveGroups(groups);
     }
     await assertAllowed(tab);
-    return { ...describeTab(await chrome.tabs.get(tab.id)), groupId: gid };
+    return { ...describeTab(await chrome.tabs.get(tab.id!)), groupId: gid };
   },
 
-  async 'tab.goto'(p) {
+  async 'tab.goto'(p: ActionParams = {}) {
     const tab = await resolveTab(p, { page: false });
-    await requireOrigin(p.url, { tabId: tab.id });
-    await chrome.tabs.update(tab.id, { url: p.url });
-    const loaded = await waitForLoad(tab.id, p.timeout ?? 20000);
-    const finalTab = loaded || (await chrome.tabs.get(tab.id));
+    await requireOrigin(p.url, { tabId: tab.id ?? null });
+    await chrome.tabs.update(tab.id!, { url: p.url! });
+    const loaded = await waitForLoad(tab.id!, p.timeout ?? 20_000);
+    const finalTab = loaded || (await chrome.tabs.get(tab.id!));
     await assertAllowed(finalTab);
     return describeTab(finalTab);
   },
 
-  async 'tab.back'(p = {}) {
+  async 'tab.back'(p: ActionParams = {}) {
     const tab = await resolveTab(p, { page: false });
-    await chrome.tabs.goBack(tab.id);
-    const loaded = await waitForLoad(tab.id, p.timeout ?? 15000);
-    return describeTab(loaded || (await chrome.tabs.get(tab.id)));
+    await chrome.tabs.goBack(tab.id!);
+    const loaded = await waitForLoad(tab.id!, p.timeout ?? 15_000);
+    return describeTab(loaded || (await chrome.tabs.get(tab.id!)));
   },
 
-  async 'tab.forward'(p = {}) {
+  async 'tab.forward'(p: ActionParams = {}) {
     const tab = await resolveTab(p, { page: false });
-    await chrome.tabs.goForward(tab.id);
-    const loaded = await waitForLoad(tab.id, p.timeout ?? 15000);
-    return describeTab(loaded || (await chrome.tabs.get(tab.id)));
+    await chrome.tabs.goForward(tab.id!);
+    const loaded = await waitForLoad(tab.id!, p.timeout ?? 15_000);
+    return describeTab(loaded || (await chrome.tabs.get(tab.id!)));
   },
 
-  async 'tab.reload'(p = {}) {
+  async 'tab.reload'(p: ActionParams = {}) {
     const tab = await resolveTab(p, { page: false });
-    await chrome.tabs.reload(tab.id, { bypassCache: !!p.hard });
-    const loaded = await waitForLoad(tab.id, p.timeout ?? 20000);
-    return describeTab(loaded || (await chrome.tabs.get(tab.id)));
+    await chrome.tabs.reload(tab.id!, { bypassCache: !!p.hard });
+    const loaded = await waitForLoad(tab.id!, p.timeout ?? 20_000);
+    return describeTab(loaded || (await chrome.tabs.get(tab.id!)));
   },
 
-  async 'page.snapshot'(p = {}) {
+  async 'page.snapshot'(p: ActionParams = {}) {
     const tab = await resolveTab(p);
-    return callPage(tab, 'snapshot', p);
+    return callPage<SnapshotResult>(tab, 'snapshot', p);
   },
 
-  async 'page.click'(p = {}) {
+  async 'page.click'(p: ActionParams = {}) {
     const tab = await resolveTab(p);
     return callPage(tab, 'click', p);
   },
 
-  async 'page.type'(p = {}) {
+  async 'page.type'(p: ActionParams = {}) {
     const tab = await resolveTab(p);
     return callPage(tab, 'type', p);
   },
 
-  async 'page.key'(p = {}) {
+  async 'page.key'(p: ActionParams = {}) {
     const tab = await resolveTab(p);
     return callPage(tab, 'key', p);
   },
 
-  async 'page.scroll'(p = {}) {
+  async 'page.scroll'(p: ActionParams = {}) {
     const tab = await resolveTab(p);
     return callPage(tab, 'scroll', p);
   },
 
-  async 'page.hover'(p = {}) {
+  async 'page.hover'(p: ActionParams = {}) {
     const tab = await resolveTab(p);
     return callPage(tab, 'hover', p);
   },
 
-  async 'page.select'(p = {}) {
+  async 'page.select'(p: ActionParams = {}) {
     const tab = await resolveTab(p);
     return callPage(tab, 'select', p);
   },
 
-  async 'page.wait'(p = {}) {
+  async 'page.wait'(p: ActionParams = {}) {
     const tab = await resolveTab(p);
     return callPage(tab, 'wait', p);
   },
 
-  async 'page.find'(p = {}) {
+  async 'page.find'(p: ActionParams = {}) {
     const tab = await resolveTab(p);
     return callPage(tab, 'find', p);
   },
 
-  async 'page.text'(p = {}) {
+  async 'page.text'(p: ActionParams = {}) {
     const tab = await resolveTab(p);
     return callPage(tab, 'text', p);
   },
 
-  async 'page.links'(p = {}) {
+  async 'page.links'(p: ActionParams = {}) {
     const tab = await resolveTab(p);
     return callPage(tab, 'links', p);
   },
 
-  async 'page.query'(p = {}) {
+  async 'page.query'(p: ActionParams = {}) {
     const tab = await resolveTab(p);
     return callPage(tab, 'query', p);
   },
 
   /** Escape hatch: run JS in the page. Tries the page's own world first, then
    *  the content-script world (needed on sites with a strict CSP). */
-  async 'page.eval'(p = {}) {
+  async 'page.eval'(p: ActionParams = {}) {
     const tab = await resolveTab(p);
     if (!p.expression) throw fail('bad_request', 'page.eval needs an expression');
-    await ensureInjected(tab.id);
+    await ensureInjected(tab.id!);
 
-    const inject = async (world) => {
+    type EvalResult = { ok: boolean; value?: unknown; error?: string };
+
+    const inject = async (world: 'MAIN' | 'ISOLATED'): Promise<EvalResult | undefined> => {
       const frames = await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
+        target: { tabId: tab.id! },
         world,
         args: [String(p.expression)],
-        func: (expression) => {
+        func: (expression: string) => {
           try {
             // eslint-disable-next-line no-eval
             const value = eval(expression);
-            let json;
+            let json: unknown;
             try {
               json = JSON.parse(
-                JSON.stringify(value, (k, v) => (typeof v === 'function' ? `[Function ${v.name || 'anonymous'}]` : v)),
+                JSON.stringify(value, (_k, v) => (typeof v === 'function' ? `[Function ${v.name || 'anonymous'}]` : v)),
               );
             } catch {
               json = String(value);
             }
             return { ok: true, value: json === undefined ? String(value) : json };
           } catch (e) {
-            return { ok: false, error: String(e && e.message ? e.message : e) };
+            return { ok: false, error: String(e && (e as Error).message ? (e as Error).message : e) };
           }
         },
       });
-      return frames?.[0]?.result;
+      return frames?.[0]?.result as EvalResult | undefined;
     };
 
-    let out;
-    let world = 'MAIN';
+    let out: EvalResult | undefined;
+    let world: 'MAIN' | 'ISOLATED' = 'MAIN';
     try {
       out = await inject('MAIN');
       if (out && !out.ok && /Content Security Policy|unsafe-eval/i.test(out.error || '')) {
@@ -642,7 +687,7 @@ const methods = {
         out = await inject('ISOLATED');
       }
     } catch (e) {
-      throw fail('restricted_page', e.message);
+      throw fail('restricted_page', (e as Error).message);
     }
     if (!out) throw fail('eval_failed', 'No result from page');
     if (!out.ok) {
@@ -652,25 +697,42 @@ const methods = {
           "This site's Content-Security-Policy blocks eval, so page.eval cannot run here. Use snapshot, text, find, links or query instead.",
         );
       }
-      throw fail('eval_failed', out.error);
+      throw fail('eval_failed', out.error || 'evaluation failed');
     }
     return { value: out.value, world: world === 'MAIN' ? 'page' : 'isolated' };
   },
 
-  async 'page.screenshot'(p = {}) {
+  async 'page.screenshot'(p: ActionParams = {}) {
     const tab = await resolveTab(p, { page: false });
     await assertAllowed(tab);
-    await chrome.tabs.update(tab.id, { active: true });
-    try {
-      await chrome.windows.update(tab.windowId, { focused: true });
-    } catch {}
+    // captureVisibleTab only sees the *active* tab of a window, so the tab is
+    // borrowed for the length of the capture and then handed back to whatever
+    // the user was reading. Window focus is left alone unless it was lost.
+    const [previous] = await chrome.tabs.query({ windowId: tab.windowId, active: true });
+    const borrowed = previous?.id !== tab.id;
+    if (borrowed) await chrome.tabs.update(tab.id!, { active: true });
+    if (borrowed && !(await chrome.windows.get(tab.windowId)).focused) {
+      try {
+        await chrome.windows.update(tab.windowId, { focused: true });
+      } catch {
+        /* window may be gone */
+      }
+    }
     await sleep(p.delayMs ?? 250);
-    const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
-    let meta = {};
     try {
-      meta = await callPage(tab, 'viewport', {});
-    } catch {}
-    return { dataUrl, url: tab.url, title: tab.title, ...meta };
+      const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
+      let meta: unknown = {};
+      try {
+        meta = await callPage(tab, 'viewport', {});
+      } catch {
+        /* viewport is nice to have */
+      }
+      return { dataUrl, url: tab.url, title: tab.title, ...(meta as object) };
+    } finally {
+      if (borrowed && previous?.id != null) {
+        await chrome.tabs.update(previous.id, { active: true }).catch(() => undefined);
+      }
+    }
   },
 
   async 'policy.get'() {
@@ -679,7 +741,7 @@ const methods = {
   },
 
   /** Creates a pending request the user answers in the popup. */
-  async 'policy.request'(p = {}) {
+  async 'policy.request'(p: ActionParams = {}) {
     const origin = p.origin || originOf(p.url || '');
     if (!origin) throw fail('bad_request', 'policy.request needs an origin');
     await chrome.storage.local.set({ pendingOrigin: { origin, url: p.url || '', at: Date.now() } });
@@ -692,15 +754,17 @@ const methods = {
 /* websocket                                                           */
 /* ------------------------------------------------------------------ */
 
-function send(obj) {
+function send(obj: unknown): void {
   if (socket && socket.readyState === WebSocket.OPEN) {
     try {
       socket.send(JSON.stringify(obj));
-    } catch {}
+    } catch {
+      /* socket closing */
+    }
   }
 }
 
-async function paintBadge() {
+async function paintBadge(): Promise<void> {
   const { pendingOrigin } = await getSettings().catch(() => ({ pendingOrigin: null }));
   try {
     if (pendingOrigin) {
@@ -715,18 +779,19 @@ async function paintBadge() {
       await chrome.action.setBadgeText({ text: '' });
       await chrome.action.setTitle({ title: 'Browser Bridge - daemon not running' });
     }
-  } catch {}
+  } catch {
+    /* badge is cosmetic */
+  }
 }
 
-function scheduleReconnect() {
-  clearTimeout(reconnectTimer);
+function scheduleReconnect(): void {
+  if (reconnectTimer) clearTimeout(reconnectTimer);
   const delay = backoffMs;
   backoffMs = Math.min(backoffMs * 1.7, 5000);
   reconnectTimer = setTimeout(connect, delay);
 }
-let reconnectTimer = null;
 
-function connect() {
+function connect(): void {
   if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) return;
   try {
     socket = new WebSocket(WS_URL);
@@ -737,16 +802,11 @@ function connect() {
   socket.onopen = () => {
     connected = true;
     backoffMs = 700;
-    send({
-      type: 'hello',
-      version: VERSION,
-      ua: navigator.userAgent,
-      extensionId: chrome.runtime.id,
-    });
-    paintBadge();
+    send({ type: 'hello', version: VERSION, ua: navigator.userAgent, extensionId: chrome.runtime.id });
+    void paintBadge();
   };
-  socket.onmessage = (ev) => {
-    let msg;
+  socket.onmessage = (ev: MessageEvent<string>) => {
+    let msg: { type?: string; id?: string; method?: string; params?: ActionParams };
     try {
       msg = JSON.parse(ev.data);
     } catch {
@@ -758,7 +818,7 @@ function connect() {
     }
     if (msg.type === 'cmd' && msg.id) {
       inflight++;
-      handleCommand(msg).finally(() => {
+      void handleCommand({ id: msg.id, method: msg.method || '', params: msg.params }).finally(() => {
         inflight--;
       });
     }
@@ -766,17 +826,19 @@ function connect() {
   socket.onclose = () => {
     connected = false;
     socket = null;
-    paintBadge();
+    void paintBadge();
     scheduleReconnect();
   };
   socket.onerror = () => {
     try {
-      socket.close();
-    } catch {}
+      socket?.close();
+    } catch {
+      /* already closed */
+    }
   };
 }
 
-async function handleCommand({ id, method, params }) {
+async function handleCommand({ id, method, params }: { id: string; method: string; params?: ActionParams }): Promise<void> {
   const started = Date.now();
   try {
     const fn = methods[method];
@@ -784,11 +846,12 @@ async function handleCommand({ id, method, params }) {
     const result = await fn(params || {});
     send({ type: 'result', id, ok: true, result, ms: Date.now() - started });
   } catch (e) {
+    const err = e as BridgeError;
     send({
       type: 'result',
       id,
       ok: false,
-      error: { code: e.code || 'error', message: e.message || String(e) },
+      error: { code: err.code || 'error', message: err.message || String(e) },
       ms: Date.now() - started,
     });
   }
@@ -814,8 +877,14 @@ chrome.tabs.onUpdated.addListener(() => {
   if (!connected) connect();
 });
 
-chrome.runtime.onMessage.addListener((msg, sender, respond) => {
-  (async () => {
+interface PopupMessage {
+  type?: string;
+  origin?: string;
+  value?: boolean;
+}
+
+chrome.runtime.onMessage.addListener((msg: PopupMessage, _sender, respond: (r: unknown) => void) => {
+  void (async () => {
     if (msg?.type === 'state') {
       const { allowedOrigins, autoAllow, pendingOrigin } = await getSettings();
       const tabs = await agentTabs();
@@ -832,8 +901,8 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
     if (msg?.type === 'allow' || msg?.type === 'revoke') {
       const { allowedOrigins } = await getSettings();
       const list = new Set(allowedOrigins);
-      if (msg.type === 'allow') list.add(msg.origin);
-      else list.delete(msg.origin);
+      if (msg.type === 'allow' && msg.origin) list.add(msg.origin);
+      else if (msg.origin) list.delete(msg.origin);
       await chrome.storage.local.set({ allowedOrigins: [...list], pendingOrigin: null });
       await paintBadge();
       respond({ ok: true, allowedOrigins: [...list] });
@@ -853,15 +922,17 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
     }
     if (msg?.type === 'reset-group') {
       try {
-        const out = await methods['group.reset']();
-        respond({ ok: true, ...out });
+        const out = await methods['group.reset']!({});
+        respond({ ok: true, ...(out as object) });
       } catch (e) {
-        respond({ ok: false, error: e.message });
+        respond({ ok: false, error: (e as Error).message });
       }
       return;
     }
     if (msg?.type === 'open-agent-tab') {
-      const out = await methods['tab.open']({ url: 'https://example.com' }).catch((e) => ({ error: e.message }));
+      const out = (await methods['tab.open']!({ url: 'https://example.com' }).catch((e: Error) => ({
+        error: e.message,
+      }))) as Record<string, unknown>;
       respond({ ok: !out.error, ...out });
       return;
     }
@@ -871,4 +942,4 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
 });
 
 connect();
-paintBadge();
+void paintBadge();

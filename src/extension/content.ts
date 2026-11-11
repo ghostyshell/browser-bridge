@@ -3,11 +3,20 @@
  *
  * Injected on demand by the service worker. Exposes a tiny RPC surface:
  *   snapshot / click / type / key / scroll / hover / select / wait / find /
- *   text / links / viewport
+ *   text / links / query / viewport
  *
  * Refs ([12]) are written onto elements as data-bb-ref and are only valid
  * until the next snapshot or navigation.
  */
+
+import type { Envelope, PageParams, SnapshotElement, SnapshotResult } from '../shared/types';
+
+declare global {
+  interface Window {
+    __bbInstalled?: boolean;
+  }
+}
+
 (() => {
   if (window.__bbInstalled) return;
   window.__bbInstalled = true;
@@ -15,9 +24,9 @@
   const REF = 'data-bb-ref';
   const MAX_ELEMENTS = 500;
 
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  const collapse = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
-  const clip = (s, n) => {
+  const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+  const collapse = (s: unknown): string => String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
+  const clip = (s: unknown, n: number): string => {
     const t = collapse(s);
     return t.length > n ? `${t.slice(0, n - 1)}…` : t;
   };
@@ -59,11 +68,13 @@
     'label',
   ].join(',');
 
+  type El = HTMLElement & { readonly type?: string; readonly value?: string; readonly checked?: boolean };
+
   /* ---------------------------------------------------------------- */
   /* element inspection                                               */
   /* ---------------------------------------------------------------- */
 
-  function isVisible(el) {
+  function isVisible(el: Element | null): boolean {
     if (!el || !el.isConnected) return false;
     if (el.closest('[aria-hidden="true"]')) return false;
     const cs = getComputedStyle(el);
@@ -74,7 +85,7 @@
     return true;
   }
 
-  function labelText(el) {
+  function labelText(el: El): string {
     const aria = el.getAttribute('aria-labelledby');
     if (aria) {
       const txt = aria
@@ -86,14 +97,14 @@
     }
     if (el.id) {
       const lbl = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
-      if (lbl) return collapse(lbl.innerText);
+      if (lbl) return collapse((lbl as HTMLElement).innerText);
     }
     const wrapping = el.closest('label');
-    if (wrapping && wrapping !== el) return collapse(wrapping.innerText);
+    if (wrapping && wrapping !== el) return collapse((wrapping as HTMLElement).innerText);
     return '';
   }
 
-  function nameOf(el) {
+  function nameOf(el: El): string {
     const tag = el.tagName.toLowerCase();
     const aria = el.getAttribute('aria-label');
     if (aria && collapse(aria)) return clip(aria, 120);
@@ -103,7 +114,7 @@
     if (tag === 'input') {
       const type = (el.type || 'text').toLowerCase();
       if (['submit', 'button', 'reset'].includes(type)) return clip(el.value, 120);
-      if (type === 'image') return clip(el.alt || el.value, 120);
+      if (type === 'image') return clip(el.getAttribute('alt') || el.value, 120);
       return clip(el.getAttribute('placeholder') || el.getAttribute('title') || el.getAttribute('name') || '', 120);
     }
     const txt = collapse(el.innerText || el.textContent);
@@ -111,7 +122,7 @@
     return clip(el.getAttribute('placeholder') || el.getAttribute('title') || el.getAttribute('alt') || '', 120);
   }
 
-  function roleOf(el) {
+  function roleOf(el: El): string {
     const explicit = el.getAttribute('role');
     if (explicit) return explicit.toLowerCase();
     const tag = el.tagName.toLowerCase();
@@ -120,13 +131,13 @@
     if (tag === 'summary') return 'button';
     if (/^h[1-6]$/.test(tag)) return `heading${tag[1]}`;
     if (tag === 'img') return 'image';
-    if (tag === 'select') return el.multiple ? 'listbox' : 'combobox';
+    if (tag === 'select') return (el as unknown as HTMLSelectElement).multiple ? 'listbox' : 'combobox';
     if (tag === 'textarea') return 'textbox';
     if (tag === 'label') return 'label';
     if (tag === 'details') return 'disclosure';
     if (tag === 'input') {
       const type = (el.type || 'text').toLowerCase();
-      const map = {
+      const map: Record<string, string> = {
         checkbox: 'checkbox',
         radio: 'radio',
         submit: 'button',
@@ -145,7 +156,7 @@
     return tag;
   }
 
-  function isInteresting(el, role) {
+  function isInteresting(el: El, role: string): boolean {
     if (role === 'hidden') return false;
     if (role === 'label') return false;
     if (role.startsWith('heading') || role === 'image') return !!nameOf(el);
@@ -153,11 +164,11 @@
     return !!nameOf(el) || role === 'button' || role === 'link';
   }
 
-  function stateOf(el) {
-    const bits = [];
+  function stateOf(el: El): string[] {
+    const bits: string[] = [];
     const tag = el.tagName.toLowerCase();
     const role = (el.getAttribute('role') || '').toLowerCase();
-    if (el.disabled || el.getAttribute('aria-disabled') === 'true') bits.push('disabled');
+    if ((el as HTMLButtonElement).disabled || el.getAttribute('aria-disabled') === 'true') bits.push('disabled');
     if (tag === 'input' || role === 'checkbox' || role === 'switch') {
       const type = (el.type || '').toLowerCase();
       if (type === 'checkbox' || type === 'radio' || role === 'checkbox' || role === 'switch') {
@@ -165,19 +176,18 @@
         bits.push(on ? 'checked' : 'unchecked');
       }
     }
-    if (el.required || el.getAttribute('aria-required') === 'true') bits.push('required');
-    if (el.expanded !== undefined) bits.push(el.expanded ? 'expanded' : 'collapsed');
+    if ((el as HTMLInputElement).required || el.getAttribute('aria-required') === 'true') bits.push('required');
     if (el.getAttribute('aria-expanded')) bits.push(`aria-expanded=${el.getAttribute('aria-expanded')}`);
     if (el.getAttribute('aria-pressed')) bits.push(`pressed=${el.getAttribute('aria-pressed')}`);
     if (el.getAttribute('aria-selected') === 'true') bits.push('selected');
-    if (el.readOnly) bits.push('readonly');
+    if ((el as HTMLInputElement).readOnly) bits.push('readonly');
     return bits;
   }
 
-  function valueOf(el) {
+  function valueOf(el: El): string {
     const tag = el.tagName.toLowerCase();
     if (tag === 'select') {
-      const opts = [...el.selectedOptions].map((o) => collapse(o.textContent));
+      const opts = [...(el as unknown as HTMLSelectElement).selectedOptions].map((o) => collapse(o.textContent));
       return opts.join(' / ');
     }
     if (tag === 'input' && (el.type || '').toLowerCase() === 'checkbox') return '';
@@ -186,7 +196,7 @@
     return '';
   }
 
-  function hrefOf(el) {
+  function hrefOf(el: El): string {
     if (el.tagName.toLowerCase() !== 'a') return '';
     const href = el.getAttribute('href') || '';
     if (!href || href.startsWith('javascript:')) return '';
@@ -201,21 +211,22 @@
   /* snapshot                                                         */
   /* ---------------------------------------------------------------- */
 
-  function snapshot(p = {}) {
+  function snapshot(p: PageParams = {}): SnapshotResult {
     const maxEls = Math.min(Number(p.maxElements) || 300, MAX_ELEMENTS);
     const includeText = p.text !== false;
-    const textLimit = Math.min(Number(p.textLength) || 2000, 20000);
+    const textLimit = Math.min(Number(p.textLength) || 2000, 20_000);
 
     document.querySelectorAll(`[${REF}]`).forEach((el) => el.removeAttribute(REF));
 
-    const seen = new Set();
-    const elements = [];
+    const seen = new Set<Element>();
+    const elements: SnapshotElement[] = [];
     let ref = 0;
 
-    for (const el of document.querySelectorAll(CANDIDATES)) {
+    for (const node of document.querySelectorAll(CANDIDATES)) {
       if (ref >= maxEls) break;
-      if (seen.has(el)) continue;
-      seen.add(el);
+      if (seen.has(node)) continue;
+      seen.add(node);
+      const el = node as El;
       const role = roleOf(el);
       if (!isInteresting(el, role)) continue;
       if (!isVisible(el)) continue;
@@ -250,7 +261,7 @@
     const scrollable = Math.max(0, document.documentElement.scrollHeight - innerHeight);
     const pct = scrollable ? Math.round((scrollY / scrollable) * 100) : 0;
 
-    const result = {
+    return {
       url: location.href,
       title: document.title,
       viewport: {
@@ -273,35 +284,33 @@
       lines,
       text: includeText ? clip(document.body?.innerText || '', textLimit) : '',
     };
-    return result;
   }
 
   /* ---------------------------------------------------------------- */
   /* element lookup                                                   */
   /* ---------------------------------------------------------------- */
 
-  function find(p = {}) {
+  function find(p: PageParams = {}): El {
     if (p.ref !== undefined && p.ref !== null && p.ref !== '') {
       const el = document.querySelector(`[${REF}="${CSS.escape(String(p.ref))}"]`);
       if (!el) {
-        throw new Error(
-          `Element [${p.ref}] is gone (page changed since the snapshot). Take a fresh snapshot.`,
-        );
+        throw new Error(`Element [${p.ref}] is gone (page changed since the snapshot). Take a fresh snapshot.`);
       }
-      return el;
+      return el as El;
     }
     if (p.selector) {
       const list = document.querySelectorAll(p.selector);
       if (!list.length) throw new Error(`No element matches selector "${p.selector}"`);
       const el = list[Number(p.index) || 0];
       if (!el) throw new Error(`Selector "${p.selector}" matched ${list.length} elements; index out of range`);
-      return el;
+      return el as El;
     }
     if (p.text) {
       const needle = collapse(p.text).toLowerCase();
       const nodes = document.querySelectorAll('a,button,[role="button"],[role="link"],label,h1,h2,h3,h4');
-      let partial = null;
-      for (const el of nodes) {
+      let partial: El | null = null;
+      for (const node of nodes) {
+        const el = node as El;
         const text = collapse(el.innerText).toLowerCase();
         if (text === needle) return el;
         if (!partial && text.includes(needle)) partial = el;
@@ -312,7 +321,7 @@
     throw new Error('Provide a ref (from a snapshot), a selector, or text.');
   }
 
-  function describeEl(el) {
+  function describeEl(el: El): { role: string; name: string; tag: string } {
     return { role: roleOf(el), name: nameOf(el), tag: el.tagName.toLowerCase() };
   }
 
@@ -320,7 +329,7 @@
   /* actions                                                          */
   /* ---------------------------------------------------------------- */
 
-  async function click(p = {}) {
+  async function click(p: PageParams = {}) {
     const el = find(p);
     el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
     await sleep(60);
@@ -362,7 +371,7 @@
     };
   }
 
-  async function hover(p = {}) {
+  async function hover(p: PageParams = {}) {
     const el = find(p);
     el.scrollIntoView({ block: 'center', behavior: 'instant' });
     await sleep(50);
@@ -385,23 +394,27 @@
     return { hovered: describeEl(el) };
   }
 
-  async function type(p = {}) {
+  function isField(el: El): el is HTMLInputElement | HTMLTextAreaElement {
+    return el.matches('input,textarea');
+  }
+
+  async function type(p: PageParams = {}) {
     const el = find(p);
     const text = String(p.text ?? '');
     el.scrollIntoView({ block: 'center', behavior: 'instant' });
     if (typeof el.focus === 'function') el.focus();
     await sleep(30);
 
-    const isField = el.matches('input,textarea');
+    const field = isField(el);
     if (p.clear !== false) {
-      if (isField && typeof el.select === 'function') {
+      if (field && typeof el.select === 'function') {
         el.select();
       } else if (el.isContentEditable) {
         const range = document.createRange();
         range.selectNodeContents(el);
         const sel = getSelection();
-        sel.removeAllRanges();
-        sel.addRange(range);
+        sel?.removeAllRanges();
+        sel?.addRange(range);
       }
     }
 
@@ -409,7 +422,7 @@
       // Per-character input, for autocomplete / typeahead widgets.
       for (const ch of text) {
         if (!document.execCommand('insertText', false, ch)) {
-          el.value = (el.value || '') + ch;
+          if (field) el.value = (el.value || '') + ch;
           el.dispatchEvent(new InputEvent('input', { bubbles: true, data: ch, inputType: 'insertText' }));
         }
         await sleep(Number(p.slow) || 60);
@@ -422,7 +435,7 @@
         inserted = false;
       }
       if (!inserted) {
-        if (isField) {
+        if (field) {
           const proto = el.tagName.toLowerCase() === 'textarea' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
           const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
           if (setter) setter.call(el, text);
@@ -430,7 +443,7 @@
         } else if (el.isContentEditable) {
           el.textContent = text;
         } else {
-          el.value = text;
+          (el as El & { value: string }).value = text;
         }
         el.dispatchEvent(new InputEvent('input', { bubbles: true, data: text, inputType: 'insertText' }));
       }
@@ -439,20 +452,18 @@
     await sleep(60);
 
     let submitted = false;
-    if (p.submit) {
-      submitted = await submitEl(el);
-    }
+    if (p.submit) submitted = await submitEl(el);
 
     return {
       typed: describeEl(el),
-      value: isField ? clip(el.value, 300) : clip(el.innerText, 300),
+      value: field ? clip(el.value, 300) : clip(el.innerText, 300),
       submitted,
       url: location.href,
     };
   }
 
-  async function submitEl(el) {
-    const form = el.form || el.closest('form');
+  async function submitEl(el: El): Promise<boolean> {
+    const form = (el as HTMLInputElement).form || el.closest('form');
     if (form) {
       if (typeof form.requestSubmit === 'function') {
         form.requestSubmit();
@@ -463,7 +474,7 @@
       await sleep(200);
       return true;
     }
-    const target = el || document.activeElement || document.body;
+    const target: El = el || (document.activeElement as El) || (document.body as El);
     const ev = { bubbles: true, cancelable: true, composed: true, key: 'Enter', code: 'Enter', keyCode: 13, which: 13 };
     target.dispatchEvent(new KeyboardEvent('keydown', ev));
     target.dispatchEvent(new KeyboardEvent('keypress', ev));
@@ -472,7 +483,7 @@
     return false;
   }
 
-  const KEY_CODES = {
+  const KEY_CODES: Record<string, number> = {
     Enter: 13,
     Tab: 9,
     Escape: 27,
@@ -491,27 +502,30 @@
     Space: 32,
   };
 
-  function focusables() {
-    return [...document.querySelectorAll('a[href],button,input,select,textarea,[tabindex]:not([tabindex="-1"]),[contenteditable="true"]')].filter(
-      (el) => !el.disabled && isVisible(el),
-    );
+  function focusables(): El[] {
+    return [
+      ...document.querySelectorAll(
+        'a[href],button,input,select,textarea,[tabindex]:not([tabindex="-1"]),[contenteditable="true"]',
+      ),
+    ].filter((el) => !(el as HTMLButtonElement).disabled && isVisible(el)) as El[];
   }
 
-  async function key(p = {}) {
+  async function key(p: PageParams = {}) {
     const combo = String(p.keys || p.key || '');
     if (!combo) throw new Error('Provide keys, e.g. "Enter", "Escape", "Meta+a", "Shift+Tab".');
     const parts = combo.split('+').map((s) => s.trim());
-    const rawKey = parts.pop();
+    const rawKey = parts.pop() || '';
     const keyName = rawKey === 'Space' ? ' ' : rawKey;
     const mods = new Set(parts.map((s) => s.toLowerCase()));
+    const charCode = keyName.length === 1 ? keyName.toUpperCase().charCodeAt(0) : 0;
     const ev = {
       bubbles: true,
       cancelable: true,
       composed: true,
       key: keyName,
       code: keyName.length === 1 ? `Key${keyName.toUpperCase()}` : keyName,
-      keyCode: KEY_CODES[keyName] || (keyName.length === 1 ? keyName.toUpperCase().charCodeAt(0) : 0),
-      which: KEY_CODES[keyName] || (keyName.length === 1 ? keyName.toUpperCase().charCodeAt(0) : 0),
+      keyCode: KEY_CODES[keyName] || charCode,
+      which: KEY_CODES[keyName] || charCode,
       altKey: mods.has('alt'),
       ctrlKey: mods.has('ctrl') || mods.has('control'),
       metaKey: mods.has('meta') || mods.has('cmd') || mods.has('command'),
@@ -519,22 +533,23 @@
     };
     const mod = ev.ctrlKey || ev.metaKey;
 
-    let el = p.ref !== undefined || p.selector ? find(p) : document.activeElement || document.body;
+    const el: El =
+      p.ref !== undefined || p.selector ? find(p) : ((document.activeElement as El) || (document.body as El));
     if (typeof el.focus === 'function') el.focus();
 
     // Synthetic events cannot trigger native browser shortcuts, so cover the
     // ones an agent actually needs.
     if (mod && keyName.toLowerCase() === 'a') {
-      if (el.matches?.('input,textarea')) el.select();
-      else document.execCommand('selectAll', false, null);
+      if (el.matches?.('input,textarea')) (el as HTMLInputElement).select();
+      else document.execCommand('selectAll', false, undefined);
       return { key: combo, handled: 'select-all' };
     }
     if (keyName === 'Tab') {
       const list = focusables();
-      const i = list.indexOf(document.activeElement);
+      const i = list.indexOf(document.activeElement as El);
       const next = list[(i + (ev.shiftKey ? -1 : 1) + list.length) % list.length];
       if (next) next.focus();
-      return { key: combo, handled: 'focus', focused: describeEl(document.activeElement) };
+      return { key: combo, handled: 'focus', focused: describeEl((document.activeElement as El) || el) };
     }
     if (keyName === 'Enter') {
       const submitted = await submitEl(el);
@@ -548,7 +563,9 @@
       el.dispatchEvent(new KeyboardEvent('keyup', ev));
       try {
         el.blur();
-      } catch {}
+      } catch {
+        /* not focusable */
+      }
       return { key: combo, handled: 'escape' };
     }
 
@@ -559,8 +576,8 @@
     return { key: combo };
   }
 
-  async function scroll(p = {}) {
-    const mode = String(p.direction || p.to || 'down');
+  async function scroll(p: PageParams = {}) {
+    const mode = String(p.direction || 'down');
     if (p.ref !== undefined && p.ref !== '') {
       const el = find(p);
       el.scrollIntoView({ block: p.block || 'center', behavior: 'instant' });
@@ -584,22 +601,25 @@
     };
   }
 
-  async function select(p = {}) {
+  async function select(p: PageParams = {}) {
     const el = find(p);
     if (el.tagName.toLowerCase() !== 'select') throw new Error('Target is not a <select> element');
-    const wanted = new Set((Array.isArray(p.values) ? p.values : [p.value]).flat().map((v) => collapse(v).toLowerCase()));
-    const picked = [];
-    for (const opt of el.options) {
+    const sel = el as unknown as HTMLSelectElement;
+    const wanted = new Set(
+      (Array.isArray(p.values) ? p.values : [p.value]).flat().map((v) => collapse(v).toLowerCase()),
+    );
+    const picked: string[] = [];
+    for (const opt of sel.options) {
       const matches = wanted.has(collapse(opt.value).toLowerCase()) || wanted.has(collapse(opt.textContent).toLowerCase());
       if (matches) {
         opt.selected = true;
         picked.push(collapse(opt.textContent));
-      } else if (!el.multiple) {
+      } else if (!sel.multiple) {
         opt.selected = false;
       }
     }
     if (!picked.length) {
-      const available = [...el.options].slice(0, 25).map((o) => collapse(o.textContent));
+      const available = [...sel.options].slice(0, 25).map((o) => collapse(o.textContent));
       throw new Error(`No option matched. Options: ${available.join(' | ')}`);
     }
     el.dispatchEvent(new Event('input', { bubbles: true }));
@@ -608,8 +628,8 @@
     return { selected: picked };
   }
 
-  async function wait(p = {}) {
-    const timeout = Math.min(Number(p.timeout) || 10000, 25000);
+  async function wait(p: PageParams = {}) {
+    const timeout = Math.min(Number(p.timeout) || 10_000, 25_000);
     const start = Date.now();
     const interval = 120;
     while (Date.now() - start < timeout) {
@@ -618,7 +638,9 @@
         if (p.gone ? !el : el) return { found: !p.gone, selector: p.selector, ms: Date.now() - start };
       }
       if (p.text) {
-        const has = collapse(document.body?.innerText || '').toLowerCase().includes(collapse(p.text).toLowerCase());
+        const has = collapse(document.body?.innerText || '')
+          .toLowerCase()
+          .includes(collapse(p.text).toLowerCase());
         if (p.gone ? !has : has) return { found: !p.gone, text: p.text, ms: Date.now() - start };
       }
       if (p.url) {
@@ -633,13 +655,13 @@
     return { found: false, timedOut: true, ms: Date.now() - start, url: location.href, title: document.title };
   }
 
-  function find_text(p = {}) {
+  function findText(p: PageParams = {}) {
     const q = collapse(p.query || p.text || '').toLowerCase();
     if (!q) throw new Error('Provide query text');
     const limit = Math.min(Number(p.limit) || 10, 50);
-    const matches = [];
+    const matches: Array<{ context: string; ref: number | null; tag: string }> = [];
     const walker = document.createTreeWalker(document.body || document.documentElement, NodeFilter.SHOW_TEXT);
-    let node;
+    let node: Node | null;
     while ((node = walker.nextNode()) && matches.length < limit) {
       const raw = node.nodeValue || '';
       const idx = raw.toLowerCase().indexOf(q);
@@ -658,36 +680,37 @@
     return { query: p.query, count: matches.length, matches };
   }
 
-  function text(p = {}) {
-    const limit = Math.min(Number(p.limit) || 8000, 60000);
+  function text(p: PageParams = {}) {
+    const limit = Math.min(Number(p.limit) || 8000, 60_000);
     return { url: location.href, title: document.title, text: clip(document.body?.innerText || '', limit) };
   }
 
-  function links(p = {}) {
+  function links(p: PageParams = {}) {
     const limit = Math.min(Number(p.limit) || 150, 1000);
-    const seen = new Set();
-    const out = [];
+    const seen = new Set<string>();
+    const out: Array<{ url: string; text: string }> = [];
     for (const a of document.querySelectorAll('a[href]')) {
       if (out.length >= limit) break;
       if (!isVisible(a)) continue;
-      const href = hrefOf(a);
+      const href = hrefOf(a as El);
       if (!href || seen.has(href)) continue;
       seen.add(href);
-      out.push({ url: href, text: clip(a.innerText || a.getAttribute('aria-label') || '', 100) });
+      out.push({ url: href, text: clip((a as HTMLElement).innerText || a.getAttribute('aria-label') || '', 100) });
     }
     return { url: location.href, links: out };
   }
 
   /** Structured alternative to eval on sites whose CSP blocks it. */
-  function query(p = {}) {
+  function query(p: PageParams = {}) {
     if (!p.selector) throw new Error('query needs a selector');
     const limit = Math.min(Number(p.limit) || 40, 500);
     const attrNames = Array.isArray(p.attrs)
       ? p.attrs
       : ['id', 'class', 'name', 'type', 'role', 'aria-label', 'href', 'data-testid'];
     const nodes = [...document.querySelectorAll(p.selector)];
-    const items = nodes.slice(0, limit).map((el) => {
-      const attrs = {};
+    const items = nodes.slice(0, limit).map((node) => {
+      const el = node as El;
+      const attrs: Record<string, string> = {};
       for (const name of attrNames) {
         const v = el.getAttribute(name);
         if (v != null) attrs[name] = clip(v, 120);
@@ -718,9 +741,23 @@
   /* rpc                                                              */
   /* ---------------------------------------------------------------- */
 
-  const ACTIONS = { snapshot, click, hover, type, key, scroll, select, wait, find: find_text, text, links, query, viewport };
+  const ACTIONS: Record<string, (p?: PageParams) => unknown> = {
+    snapshot,
+    click,
+    hover,
+    type,
+    key,
+    scroll,
+    select,
+    wait,
+    find: findText,
+    text,
+    links,
+    query,
+    viewport,
+  };
 
-  chrome.runtime.onMessage.addListener((msg, sender, respond) => {
+  chrome.runtime.onMessage.addListener((msg: Envelope, _sender, respond: (r: unknown) => void) => {
     if (!msg || msg.__bb !== 1) return;
     if (msg.action === 'ping') {
       respond({ ok: true, result: { pong: true, url: location.href } });
@@ -731,12 +768,12 @@
       respond({ ok: false, error: `Unknown page action "${msg.action}"` });
       return;
     }
-    (async () => {
+    void (async () => {
       try {
         const result = await fn(msg.params || {});
         respond({ ok: true, result });
       } catch (e) {
-        respond({ ok: false, error: e && e.message ? e.message : String(e) });
+        respond({ ok: false, error: e && (e as Error).message ? (e as Error).message : String(e) });
       }
     })();
     return true;

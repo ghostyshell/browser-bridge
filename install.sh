@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install Browser Bridge: daemon deps, CLI symlink, agent skill links.
+# Install Browser Bridge: build, deps, CLI symlink, agent skill links.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -11,12 +11,16 @@ SKILL_NAME="browser-control"
 say() { printf '  %s\n' "$*"; }
 step() { printf '\n%s\n' "$*"; }
 
-step "1/5  daemon dependencies"
-( cd "$ROOT/daemon" && npm install --no-audit --no-fund --silent )
-say "ws installed in $ROOT/daemon"
+step "1/6  dependencies"
+( cd "$ROOT" && npm install --no-audit --no-fund --silent )
+say "installed"
 
-step "2/5  CLI"
-chmod +x "$ROOT/bin/chromectl" "$ROOT/scripts/"*.sh "$ROOT/scripts/"*.js "$ROOT/scripts/"*.py 2>/dev/null || true
+step "2/6  build (TypeScript -> dist/, extension/*.js)"
+( cd "$ROOT" && npm run build )
+say "built"
+
+step "3/6  CLI"
+chmod +x "$ROOT/bin/chromectl" "$ROOT/scripts/"*.sh "$ROOT/scripts/"*.mjs "$ROOT/scripts/"*.py 2>/dev/null || true
 mkdir -p "$BIN_DIR"
 ln -sf "$ROOT/bin/chromectl" "$BIN_DIR/chromectl"
 say "linked $BIN_DIR/chromectl"
@@ -25,20 +29,20 @@ case ":$PATH:" in
   *) say "WARNING: $BIN_DIR is not on PATH - add it to your shell profile" ;;
 esac
 
-step "3/5  agent skill"
+step "4/6  agent skill"
 mkdir -p "$CLAUDE_SKILLS" "$OPENCODE_SKILLS"
 ln -sfn "$ROOT/skill" "$CLAUDE_SKILLS/$SKILL_NAME"
 ln -sfn "$CLAUDE_SKILLS/$SKILL_NAME" "$OPENCODE_SKILLS/$SKILL_NAME"
 say "$CLAUDE_SKILLS/$SKILL_NAME -> $ROOT/skill"
 say "$OPENCODE_SKILLS/$SKILL_NAME -> $CLAUDE_SKILLS/$SKILL_NAME"
 
-step "4/5  daemon"
+step "5/6  daemon"
 "$ROOT/bin/chromectl" daemon restart >/dev/null
 say "listening on http://127.0.0.1:8737"
 say "token   ~/.config/browser-bridge/token (0600)"
 say "log     ~/.config/browser-bridge/daemon.log"
 
-step "5/5  load the extension in Chrome"
+step "6/6  load the extension in Chrome"
 cat <<EOF
   It is a one-time manual step (Chrome requires a human for this):
 

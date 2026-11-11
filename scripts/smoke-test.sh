@@ -45,13 +45,13 @@ sleep 2
 check "extension connected" '"extensionConnected":true' "$(curl -s http://127.0.0.1:8737/health)"
 
 say "3. permission gate"
-node "$ROOT/scripts/cdp-ext-eval.js" "$ROOT/extension" "$CDP_PORT" \
+node "$ROOT/dist/scripts/cdp-ext-eval.js" "$ROOT/extension" "$CDP_PORT" \
   "chrome.storage.local.set({allowedOrigins:[],pendingOrigin:null,autoAllow:false}).then(()=>'reset')" >/dev/null
 OUT="$("$CTL" open "$ORIGIN/fixture.html" 2>&1)"
 check "blocked before approval" "origin_not_allowed" "$OUT"
-node "$ROOT/scripts/cdp-ext-eval.js" "$ROOT/extension" "$CDP_PORT" \
+node "$ROOT/dist/scripts/cdp-ext-eval.js" "$ROOT/extension" "$CDP_PORT" \
   "chrome.storage.local.set({allowedOrigins:['$ORIGIN'],pendingOrigin:null}).then(()=>'allowed')" >/dev/null
-check "origin is approved" "$ORIGIN" "$(node "$ROOT/scripts/cdp-ext-eval.js" "$ROOT/extension" "$CDP_PORT" "chrome.storage.local.get('allowedOrigins').then(v=>JSON.stringify(v.allowedOrigins))")"
+check "origin is approved" "$ORIGIN" "$(node "$ROOT/dist/scripts/cdp-ext-eval.js" "$ROOT/extension" "$CDP_PORT" "chrome.storage.local.get('allowedOrigins').then(v=>JSON.stringify(v.allowedOrigins))")"
 
 say "4. page interaction"
 "$CTL" reset >/dev/null 2>&1

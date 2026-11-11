@@ -16,7 +16,7 @@
   <img src="extension/icons/icon128.png" width="96" alt="Browser Bridge: a purple bridge between a terminal and a browser window">
 </p>
 
-A Chrome extension plus a local daemon that lets a terminal AI agent (Claude Code, opencode, or anything that can run a shell command) drive your real browser: open a tab group, read pages, click, type, scroll, screenshot.
+A Chromium extension plus a local daemon that lets a terminal AI agent (Claude Code, opencode, or anything that can run a shell command) drive your real browser: open a tab group, read pages, click, type, scroll, screenshot.
 
 It is the same idea as Claude in Chrome, but the agent talks to Chrome over `chromectl` instead of a chat sidebar, so any CLI agent can use it.
 
@@ -37,7 +37,7 @@ It is the same idea as Claude in Chrome, but the agent talks to Chrome over `chr
 
 ## Why an extension instead of DevTools Protocol
 
-Chrome 136+ refuses `--remote-debugging-port` on your default profile, so CDP cannot reach the browser you actually use. An extension runs inside that profile with your sessions, and a tiny native-free websocket relay gives the agent access. Nothing is exposed to the network: the daemon binds `127.0.0.1` only.
+Chromium 136+ refuses `--remote-debugging-port` on your default profile, so CDP cannot reach the browser you actually use. An extension runs inside that profile with your sessions, and a tiny native-free websocket relay gives the agent access. Nothing is exposed to the network: the daemon binds `127.0.0.1` only.
 
 ## What it can do
 
@@ -65,7 +65,7 @@ cd ~/Code/browser-bridge
 ./install.sh
 ```
 
-That installs the daemon dependencies, links `chromectl` into `~/.local/bin`, links the skill into `~/.claude/skills` and `~/.config/opencode/skills`, and starts the daemon.
+That installs dependencies, compiles the TypeScript, links `chromectl` into `~/.local/bin`, links the skill into `~/.claude/skills` and `~/.config/opencode/skills`, and starts the daemon.
 
 Then load the extension once:
 
@@ -75,6 +75,19 @@ Then load the extension once:
 4. Pin "Browser Bridge" to the toolbar
 
 The badge turns into a purple dot when the agent is connected.
+
+## Background by default
+
+Opening a page does not steal your focus. Tabs land in the Agent group and the
+agent reads, clicks and types in them while you keep working in your own tab:
+
+```bash
+chromectl open https://example.com        # stays in the background
+chromectl activate                        # bring the agent's tab to the front
+```
+
+Screenshots are the one exception, because Chrome can only capture the visible
+tab: the tab is borrowed for the capture and then handed straight back to you.
 
 ## Permission model
 
@@ -148,9 +161,22 @@ Flags: `--tab N` to target a specific agent tab, `--json` for raw output.
 
 Logs: `~/.config/browser-bridge/daemon.log`. Screenshots land in `~/.config/browser-bridge/shots/`.
 
+## Layout
+
+```
+src/daemon/      relay: /rpc over loopback, bearer token, ws to the extension
+src/cli/         chromectl
+src/extension/   service worker, content script, popup
+src/shared/      payload types shared by all three
+scripts/build.mjs  esbuild -> dist/ and extension/*.js
+```
+
+Sources are TypeScript, strict mode. `npm run build` compiles; the compiled
+`extension/*.js` and `dist/` are gitignored because they are build output.
+
 ## Tests
 
-`scripts/dev-chrome.sh` launches a throwaway Chrome profile with the extension installed over CDP, so you can exercise the whole path without touching your real browser:
+`npm run smoke` runs the whole suite. `scripts/dev-chrome.sh` launches a throwaway Chrome profile with the extension installed over CDP, so you can exercise the whole path without touching your real browser:
 
 ```bash
 scripts/dev-chrome.sh
@@ -158,7 +184,9 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8899/fixture.html  # n
 chromectl open http://127.0.0.1:8899/fixture.html
 ```
 
-The extension is installed via `Extensions.loadUnpacked` because Chrome 137+ ignores `--load-extension`.
+The extension is installed via `Extensions.loadUnpacked` because Chromium 137+ ignores `--load-extension`.
+
+Works in Edge and other Chromium browsers as well as Chrome; the browser in use is reported in `chromectl status`.
 
 ## Support
 

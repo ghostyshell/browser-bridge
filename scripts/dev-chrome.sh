@@ -26,6 +26,6 @@ if ! curl -sf "http://127.0.0.1:${PORT}/json/version" >/dev/null 2>&1; then
   done
 fi
 
-node "$ROOT/scripts/cdp-load-extension.js" "$ROOT/extension" "$PORT"
+node "$ROOT/dist/scripts/cdp-load-extension.js" "$ROOT/extension" "$PORT"
 echo "profile: $PROFILE"
 echo "cdp:     http://127.0.0.1:$PORT"
