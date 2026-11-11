@@ -279,6 +279,22 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  if (req.method === 'POST' && url.pathname === '/pin') {
+    // Test harness: route commands to a specific connected browser (the
+    // throwaway profile) instead of whichever one said hello first.
+    if (!authorized(req, url)) return fail(res, 'unauthorized', 401, 'Bad or missing token');
+    const want = url.searchParams.get('extensionId');
+    // Unpacked extensions get their id from their folder, so every browser that
+    // loaded this checkout reports the same id: take the most recent hello.
+    const match = [...clients]
+      .filter((c) => c.readyState === 1 && c.__info?.extensionId === want)
+      .sort((a, b) => (b.__info?.since ?? 0) - (a.__info?.since ?? 0))[0];
+    if (!match) return fail(res, 'no_such_client', 404, `No connected extension with id ${want}`);
+    activeClient = match;
+    log(`pinned client id=${want}`);
+    return json(res, 200, { ok: true, extension: match.__info });
+  }
+
   if (req.method === 'GET' && url.pathname === '/token') {
     if (!authorized(req, url)) return fail(res, 'unauthorized', 401, 'Bad or missing token');
     return json(res, 200, { ok: true, token: TOKEN });

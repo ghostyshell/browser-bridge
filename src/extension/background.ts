@@ -20,7 +20,7 @@ import type {
   TabDescriptor,
 } from '../shared/types';
 
-const VERSION = '1.4.2';
+const VERSION = '1.5.0';
 const PORT = 8737;
 const WS_URL = `ws://127.0.0.1:${PORT}/ws`;
 const GROUP_TITLE = 'Agent';
@@ -363,6 +363,81 @@ async function chooseWindow(): Promise<chrome.windows.Window> {
   const busiest = [...windows].sort((a, b) => (b.tabs?.length ?? 0) - (a.tabs?.length ?? 0))[0];
   return busiest ?? (await chrome.windows.getLastFocused({ windowTypes: ['normal'] }));
 }
+
+/* ------------------------------------------------------------------ */
+/* keep the user's tab                                                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Chrome activates a tab a page spawns (target=_blank, window.open) and, on
+ * some builds, a tab that joins a group. The agent's tabs are background work,
+ * so such an activation is undone and the user gets back the tab they were on.
+ *
+ * openerTabId cannot be trusted for this (Chrome reports the *active* tab as
+ * the opener when the real opener is in the background), and lastAccessed is
+ * bumped on creation, so neither says whose tab is whose. What is reliable:
+ * a spawned tab inherits its opener's group, and onActivated tells us which
+ * tab was showing before. Both are tracked here, in memory, for a few seconds.
+ */
+const SPAWN_GRACE_MS = 1500;
+const spawned = new Map<number, number>(); // tabs we created -> the user's tab
+const recentlyCreated = new Set<number>(); // any tab created in the last moment
+const shown = new Set<number>(); // activations the extension asked for itself
+const lastActive = new Map<number, number>(); // windowId -> the tab meant to be showing
+
+function keepUserTab(newTabId: number, userTabId: number | undefined): void {
+  if (userTabId == null || userTabId === newTabId) return;
+  spawned.set(newTabId, userTabId);
+  setTimeout(() => spawned.delete(newTabId), SPAWN_GRACE_MS);
+  void chrome.tabs.update(userTabId, { active: true }).catch(() => undefined);
+}
+
+/** Activate a tab on purpose (the user asked, or captureVisibleTab needs it): the guard lets it through. */
+async function showTab(tabId: number): Promise<void> {
+  shown.add(tabId);
+  setTimeout(() => shown.delete(tabId), SPAWN_GRACE_MS);
+  spawned.delete(tabId);
+  recentlyCreated.delete(tabId);
+  await chrome.tabs.update(tabId, { active: true });
+}
+
+chrome.tabs.onCreated.addListener((tab) => {
+  if (tab.id == null) return;
+  recentlyCreated.add(tab.id);
+  setTimeout(() => recentlyCreated.delete(tab.id!), SPAWN_GRACE_MS);
+});
+
+chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
+  const previous = lastActive.get(windowId);
+  if (shown.delete(tabId)) {
+    lastActive.set(windowId, tabId);
+    return;
+  }
+  void (async () => {
+    let userTab = spawned.get(tabId);
+    if (userTab == null && recentlyCreated.has(tabId)) {
+      const tab = await chrome.tabs.get(tabId).catch(() => undefined);
+      if (tab && (await isAgentTab(tab))) {
+        recentlyCreated.delete(tabId);
+        userTab = previous;
+        if (userTab == null) {
+          // Fresh worker, no history: the user's most recently viewed non-agent tab.
+          const agentGroups = Object.values(await loadGroups());
+          userTab = (await chrome.tabs.query({ windowId }))
+            .filter((t) => t.id !== tabId && !agentGroups.includes(t.groupId))
+            .sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0))[0]?.id;
+        }
+      }
+    }
+    if (userTab == null || userTab === tabId) {
+      lastActive.set(windowId, tabId);
+      return;
+    }
+    // Undone: the tab on record stays the user's, so a second spawn in the same
+    // moment restores the user's tab too, not this one.
+    await chrome.tabs.update(userTab, { active: true }).catch(() => undefined);
+  })();
+});
 
 const NAV_ACTIONS = new Set<PageAction>(['click', 'key', 'type', 'select', 'hover']);
 
@@ -798,9 +873,7 @@ const methods: Record<string, Method> = {
       groups[win.id!] = gid;
       await saveGroups(groups);
     }
-    if (p.active !== true && beforeActive?.id != null && beforeActive.id !== tab.id) {
-      await chrome.tabs.update(beforeActive.id, { active: true }).catch(() => undefined);
-    }
+    if (p.active !== true) keepUserTab(tab.id!, beforeActive?.id);
     const loaded = await waitForLoad(tab.id!, p.timeout ?? 20_000);
     const finalTab = loaded || (await chrome.tabs.get(tab.id!).catch(() => tab));
     if (p.url && p.url !== 'about:blank') {
@@ -817,7 +890,7 @@ const methods: Record<string, Method> = {
 
   async 'tab.activate'(p: ActionParams = {}) {
     const tab = await resolveTab(p, { page: false });
-    await chrome.tabs.update(tab.id!, { active: true });
+    await showTab(tab.id!);
     await chrome.windows.update(tab.windowId, { focused: true });
     // Keep the group visible so the user can see what the agent is doing.
     try {
@@ -1120,19 +1193,20 @@ const methods: Record<string, Method> = {
     // rely on). captureVisibleTab is the fallback, and it does need the tab
     // active, so there we borrow it and hand it straight back.
     try {
-      const dataUrl = await cdpScreenshot(tab.id!);
+      const dataUrl = await Promise.race([
+        cdpScreenshot(tab.id!),
+        sleep(8000).then(() => Promise.reject(new Error('cdp screenshot timed out'))),
+      ]);
       return { dataUrl, url: tab.url, title: tab.title, ...(meta as object) };
     } catch {
       const [previous] = await chrome.tabs.query({ windowId: tab.windowId, active: true });
       const borrowed = previous?.id !== tab.id;
-      if (borrowed) await chrome.tabs.update(tab.id!, { active: true });
+      if (borrowed) await showTab(tab.id!);
       try {
         const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
-        return { dataUrl, url: tab.url, title: tab.title, ...(meta as object) };
+        return { dataUrl, url: tab.url, title: tab.title, borrowed, ...(meta as object) };
       } finally {
-        if (borrowed && previous?.id != null) {
-          await chrome.tabs.update(previous.id, { active: true }).catch(() => undefined);
-        }
+        if (borrowed && previous?.id != null) await showTab(previous.id).catch(() => undefined);
       }
     }
   },

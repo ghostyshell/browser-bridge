@@ -7,6 +7,15 @@ description: Drive the user's real Chrome browser from the shell - read pages, c
 
 `chromectl` drives the user's own Chrome through the Browser Bridge extension. You get the real browser: their profile, their logins, their cookies, their extensions. Every action lands in a **purple "Agent" tab group** so the user can watch and undo.
 
+## Background by design
+
+Everything runs in tabs behind the one the user is reading, like Claude in Chrome: `open` creates tabs in the background, clicks and keystrokes go through the debugger with focus emulation, screenshots capture the background tab directly, and a tab a page spawns (`target=_blank`, `window.open`) is pulled into the Agent group with the user's tab re-activated. The user does not need to watch, and must not be interrupted.
+
+- Never run `chromectl activate` or `open --active` on your own. Only when the user asks to see the tab.
+- A page that "does nothing" is not fixed by activating it: snapshot again, `wait` on a signal, or check `chromectl daemon logs 20`.
+- If `screenshot` prints `note: ... brought to front for a moment`, the debugger could not attach to that tab (DevTools open, restricted page). Mention it once; do not retry in a loop.
+- Popup windows opened by a page (OAuth, print dialogs) are outside the group and do take focus; tell the user instead of driving them.
+
 ## Before the first action
 
 ```bash
@@ -183,3 +192,4 @@ chromectl screenshot --out /tmp/pricing.png
 - `alert()`/`confirm()` blocks the page: ask the user to dismiss it.
 - No file uploads, native permission prompts, or download dialogs.
 - One command at a time; do not run two `chromectl` actions in parallel on the same tab.
+- Chromium shows an "is debugging this browser" bar while the debugger is attached; it goes away 20s after the last action. That is expected, not an error.

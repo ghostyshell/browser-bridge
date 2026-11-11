@@ -100,6 +100,26 @@ brings a tab or window forward.
 Debugger attachment shows Chromium's "is debugging this browser" notice while
 it is attached; the session detaches after 20 seconds idle.
 
+The same rule holds for everything the agent does, the way Claude in Chrome
+works in its own tab group while you keep browsing:
+
+- `chromectl open` creates the tab behind your current one (`--active` is the
+  opt-in), and a late activation Chrome sneaks in when the tab joins the group
+  is undone.
+- A tab the agent's page spawns (`target=_blank`, `window.open`) lands in the
+  Agent group and your tab is re-activated within the same tick.
+- `chromectl screenshot` captures through the debugger, so a background tab is
+  photographed as it is right now, not as a stale frame, and nothing is brought
+  forward. Only if the debugger cannot attach (DevTools open on that tab, a
+  restricted page) does it fall back to `captureVisibleTab`, which needs the tab
+  in front for a moment; the CLI prints a note when that happened.
+
+`scripts/smoke-test.sh` runs the whole flow against a throwaway Chrome profile
+and asserts that your active tab never changes. Unpacked extensions share one id
+across every browser that loaded the same folder, so the test pins the daemon
+to the throwaway browser (`POST /pin`) and proves the pin with a nonce before it
+touches anything.
+
 ## Permission model
 
 The agent can only touch tabs in its own **Agent** tab group, and only on origins you approved. Approval happens in the extension popup, which the agent cannot click:

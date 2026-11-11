@@ -135,7 +135,6 @@ const BOOLEAN_FLAGS = new Set([
   'quiet',
   'background',
   'active',
-  'index',
   'click-only',
   'cdp',
   'no-cdp',
@@ -511,7 +510,8 @@ const commands: Record<string, (ctx: CommandContext) => Promise<void>> = {
   },
 
   async screenshot({ flags }) {
-    const r = await rpc<{ path: string; width?: number; height?: number; url: string }>('page.screenshot', tabParam(flags), 90_000);
+    const r = await rpc<{ path: string; width?: number; height?: number; url: string; borrowed?: boolean }>('page.screenshot', tabParam(flags), 90_000);
+    if (r.borrowed) process.stderr.write('chromectl: note: the debugger could not capture this tab (DevTools open?), so it was brought to front for a moment\n');
     if (flags.json) return out(JSON.stringify(r, null, 2));
     if (flags.out) {
       fs.copyFileSync(r.path, String(flags.out));
