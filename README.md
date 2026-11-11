@@ -86,8 +86,19 @@ chromectl open https://example.com        # stays in the background
 chromectl activate                        # bring the agent's tab to the front
 ```
 
-Screenshots are the one exception, because Chrome can only capture the visible
-tab: the tab is borrowed for the capture and then handed straight back to you.
+Nothing is borrowed and nothing is raised. A tab that is not active in its
+window gets no animation frames, no trusted input and reports itself hidden, so
+the extension attaches the debugger to it and turns on focus emulation
+(`Emulation.setFocusEmulationEnabled` plus `Page.setWebLifecycleState active`)
+for as long as it is working there. The page then behaves as if it were focused
+while your window stays behind, and every click, keystroke and paste is
+dispatched as real `Input.*` events (`isTrusted: true`), which is what strict
+editors, CSP pages and Material widgets accept. This is the same mechanism
+Playwright and browser-use use. `chromectl activate` is the only thing that
+brings a tab or window forward.
+
+Debugger attachment shows Chromium's "is debugging this browser" notice while
+it is attached; the session detaches after 20 seconds idle.
 
 ## Permission model
 

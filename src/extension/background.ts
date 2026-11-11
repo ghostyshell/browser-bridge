@@ -20,7 +20,7 @@ import type {
   TabDescriptor,
 } from '../shared/types';
 
-const VERSION = '1.3.1';
+const VERSION = '1.4.0';
 const PORT = 8737;
 const WS_URL = `ws://127.0.0.1:${PORT}/ws`;
 const GROUP_TITLE = 'Agent';
@@ -401,6 +401,112 @@ async function callPage<T>(tab: chrome.tabs.Tab, action: PageAction, params: Act
   }
 }
 
+/* ------------------------------------------------------------------ */
+/* debugger sessions                                                   */
+/* ------------------------------------------------------------------ */
+
+const cdpAttached = new Map<number, ReturnType<typeof setTimeout>>();
+const CDP_IDLE_MS = 20_000;
+
+async function cdpDetach(tabId: number): Promise<void> {
+  const timer = cdpAttached.get(tabId);
+  if (timer) clearTimeout(timer);
+  cdpAttached.delete(tabId);
+  await chrome.debugger.detach({ tabId }).catch(() => undefined);
+}
+
+function cdpTouch(tabId: number): void {
+  const timer = cdpAttached.get(tabId);
+  if (timer) clearTimeout(timer);
+  cdpAttached.set(tabId, setTimeout(() => void cdpDetach(tabId), CDP_IDLE_MS));
+}
+
+/**
+ * Attach (once per tab) and make a background tab behave like a focused one.
+ *
+ * A tab that is not active in its window gets no animation frames and no
+ * trusted input, and reports visibilityState "hidden", so pages that gate work
+ * on visibility stall. Playwright solves this the same way: focus emulation on
+ * attach. It changes nothing the user sees and never raises the window.
+ */
+async function cdpSession(tabId: number): Promise<void> {
+  if (cdpAttached.has(tabId)) {
+    cdpTouch(tabId);
+    return;
+  }
+  await chrome.debugger.attach({ tabId }, '1.3');
+  await chrome.debugger.sendCommand({ tabId }, 'Page.enable').catch(() => undefined);
+  await chrome.debugger
+    .sendCommand({ tabId }, 'Emulation.setFocusEmulationEnabled', { enabled: true })
+    .catch(() => undefined);
+  await chrome.debugger
+    .sendCommand({ tabId }, 'Page.setWebLifecycleState', { state: 'active' })
+    .catch(() => undefined);
+  cdpTouch(tabId);
+}
+
+/**
+ * Send a CDP command. Input commands only answer once the renderer has handled
+ * the event, and a throttled renderer can hold that answer for ~5s, so the ack
+ * is raced against a short sleep instead of being awaited outright.
+ */
+async function cdp(
+  tabId: number,
+  method: string,
+  params: Record<string, unknown> = {},
+  { raceAck = true }: { raceAck?: boolean } = {},
+): Promise<unknown> {
+  await cdpSession(tabId);
+  cdpTouch(tabId);
+  const call = chrome.debugger.sendCommand({ tabId }, method, params);
+  if (method.startsWith('Input.') && raceAck) {
+    return Promise.race([call, sleep(400).then(() => undefined)]);
+  }
+  return call;
+}
+
+chrome.debugger.onDetach.addListener((source) => {
+  if (source.tabId != null) {
+    const timer = cdpAttached.get(source.tabId);
+    if (timer) clearTimeout(timer);
+    cdpAttached.delete(source.tabId);
+  }
+});
+
+/** Resolve a target to viewport coordinates through the page, via CDP. */
+async function cdpPoint(tabId: number, p: ActionParams): Promise<{ x: number; y: number; name: string } | null> {
+  const res = (await cdp(tabId, 'Runtime.evaluate', {
+    expression: `(() => {
+      const el = ${elementExpression(p)};
+      if (!el) return null;
+      el.scrollIntoView({ block: 'center', inline: 'center' });
+      const r = el.getBoundingClientRect();
+      return { x: r.left + r.width / 2, y: r.top + r.height / 2, name: (el.innerText || el.getAttribute('aria-label') || el.value || '').trim().slice(0, 80) };
+    })()`,
+    returnByValue: true,
+  })) as { result?: { value?: { x: number; y: number; name: string } | null } };
+  return res.result?.value ?? null;
+}
+
+const MOUSE_MODIFIERS: Record<string, number> = { alt: 1, ctrl: 2, meta: 4, shift: 8 };
+
+function keyDescriptor(combo: string): { key: string; code: string; modifiers: number; text?: string } {
+  const parts = combo.split('+').map((s) => s.trim()).filter(Boolean);
+  const raw = parts.pop() || '';
+  const key = raw === 'Space' ? ' ' : raw;
+  let modifiers = 0;
+  for (const m of parts) modifiers |= MOUSE_MODIFIERS[m.toLowerCase()] ?? 0;
+  const code =
+    key.length === 1
+      ? /[a-z]/i.test(key)
+        ? `Key${key.toUpperCase()}`
+        : /[0-9]/.test(key)
+          ? `Digit${key}`
+          : key
+      : key;
+  return { key, code, modifiers, text: key.length === 1 ? key : key === 'Enter' ? '\r' : undefined };
+}
+
 /** JS expression that resolves a click target from the same params the content
  *  script takes, so refs, selectors and text search behave identically. */
 function elementExpression(p: ActionParams): string {
@@ -439,52 +545,156 @@ function elementExpression(p: ActionParams): string {
  * close on mousedown, mat-option needs a trusted press).
  */
 async function cdpClick(tabId: number, p: ActionParams): Promise<Record<string, unknown>> {
-  const target = { tabId };
-  await chrome.debugger.attach(target, '1.3');
-  try {
-    const res = (await chrome.debugger.sendCommand(target, 'Runtime.evaluate', {
-      expression: `(() => {
-        const el = ${elementExpression(p)};
-        if (!el) return null;
-        el.scrollIntoView({ block: 'center', inline: 'center' });
-        const r = el.getBoundingClientRect();
-        return { x: r.left + r.width / 2, y: r.top + r.height / 2, name: (el.innerText || el.getAttribute('aria-label') || '').trim().slice(0, 80) };
-      })()`,
-      returnByValue: true,
-    })) as { result?: { value?: { x: number; y: number; name: string } } };
-    const box = res.result?.value;
-    if (!box) throw new Error('element not found');
-    for (const type of ['mousePressed', 'mouseReleased'] as const) {
-      await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
-        type,
-        x: box.x,
-        y: box.y,
-        button: 'left',
-        buttons: type === 'mousePressed' ? 1 : 0,
-        clickCount: 1,
-      });
-    }
-    await sleep(p.waitMs ?? 250);
-    return { clicked: { role: 'element', name: box.name }, url: '', navigated: false, viaCdp: true };
-  } finally {
-    await chrome.debugger.detach(target).catch(() => undefined);
+  const box = await cdpPoint(tabId, p);
+  if (!box) throw new Error('element not found');
+  for (const type of ['mouseMoved', 'mousePressed', 'mouseReleased'] as const) {
+    await cdp(tabId, 'Input.dispatchMouseEvent', {
+      type,
+      x: box.x,
+      y: box.y,
+      button: type === 'mouseMoved' ? 'none' : 'left',
+      buttons: type === 'mousePressed' ? 1 : 0,
+      clickCount: type === 'mouseMoved' ? 0 : 1,
+    });
   }
+  await sleep(p.waitMs ?? 250);
+  return { clicked: { role: 'element', name: box.name }, url: '', navigated: false, viaCdp: true };
 }
 
 /** One-shot CDP screenshot of a tab, attached and detached per capture. */
-async function cdpScreenshot(tabId: number): Promise<string> {
-  const target = { tabId };
-  await chrome.debugger.attach(target, '1.3');
-  try {
-    const res = (await chrome.debugger.sendCommand(target, 'Page.captureScreenshot', {
-      format: 'png',
-      captureBeyondViewport: false,
-    })) as { data?: string } | undefined;
-    if (!res?.data) throw new Error('no screenshot data');
-    return `data:image/png;base64,${res.data}`;
-  } finally {
-    await chrome.debugger.detach(target).catch(() => undefined);
+async function pressKey(tabId: number, combo: string, repeat = 1): Promise<void> {
+  const k = keyDescriptor(combo);
+  for (let i = 0; i < repeat; i++) {
+    await cdp(tabId, 'Input.dispatchKeyEvent', {
+      type: k.text ? 'keyDown' : 'rawKeyDown',
+      key: k.key,
+      code: k.code,
+      text: k.text,
+      modifiers: k.modifiers,
+      windowsVirtualKeyCode: k.key.length === 1 ? k.key.toUpperCase().charCodeAt(0) : 0,
+    });
+    await cdp(tabId, 'Input.dispatchKeyEvent', {
+      type: 'keyUp',
+      key: k.key,
+      code: k.code,
+      modifiers: k.modifiers,
+    });
   }
+}
+
+async function cdpType(tabId: number, p: ActionParams): Promise<Record<string, unknown>> {
+  const box = await cdpPoint(tabId, p);
+  if (!box) throw new Error('field not found');
+  // Both presses are acknowledged here: the insert below must not overtake the
+  // focus they cause.
+  await cdp(tabId, 'Input.dispatchMouseEvent', {
+    type: 'mousePressed', x: box.x, y: box.y, button: 'left', buttons: 1, clickCount: 1,
+  }, { raceAck: false });
+  await cdp(tabId, 'Input.dispatchMouseEvent', {
+    type: 'mouseReleased', x: box.x, y: box.y, button: 'left', buttons: 0, clickCount: 1,
+  }, { raceAck: false });
+  await sleep(60);
+
+  // A press can land before the page is settled and leave nothing focused. Make
+  // focus explicit rather than typing into the document.
+  const focused = (await cdp(tabId, 'Runtime.evaluate', {
+    expression: `(() => { const el = ${elementExpression(p)}; return !!el && document.activeElement === el; })()`,
+    returnByValue: true,
+  })) as { result?: { value?: boolean } };
+  if (!focused.result?.value) {
+    await cdp(tabId, 'Runtime.evaluate', {
+      expression: `(() => { const el = ${elementExpression(p)}; if (el) { el.focus(); } })()`,
+    });
+    await sleep(40);
+  }
+
+  if (p.clear !== false) {
+    // Trusted select-all then delete, so app state updates the way real input does.
+    await cdp(tabId, 'Input.dispatchKeyEvent', {
+      type: 'rawKeyDown',
+      key: 'a',
+      code: 'KeyA',
+      modifiers: 4,
+      commands: ['selectAll'],
+    });
+    await cdp(tabId, 'Input.dispatchKeyEvent', { type: 'keyUp', key: 'a', code: 'KeyA', modifiers: 4 });
+    await pressKey(tabId, 'Backspace');
+  }
+
+  const text = String(p.text ?? '');
+  if (p.slow) {
+    for (const ch of text) {
+      await cdp(tabId, 'Input.insertText', { text: ch });
+      await sleep(Number(p.slow) || 60);
+    }
+  } else if (text) {
+    await cdp(tabId, 'Input.insertText', { text });
+  }
+
+  let submitted = false;
+  if (p.submit) {
+    await pressKey(tabId, 'Enter');
+    submitted = true;
+  }
+  await sleep(150);
+  const value = (await cdp(tabId, 'Runtime.evaluate', {
+    expression: `(() => { const el = ${elementExpression(p)}; return el ? (el.value ?? el.innerText ?? '') : ''; })()`,
+    returnByValue: true,
+  })) as { result?: { value?: string } };
+  return { typed: { role: 'field', name: box.name }, value: String(value.result?.value ?? '').slice(0, 300), submitted, url: '', viaCdp: true };
+}
+
+async function cdpScroll(tabId: number, p: ActionParams): Promise<Record<string, unknown>> {
+  const direction = String(p.direction || 'down');
+  const amount = Number(p.amount) || 0.85;
+  if (p.ref !== undefined && p.ref !== '') {
+    const box = await cdpPoint(tabId, p);
+    if (box) await cdp(tabId, 'Input.dispatchMouseEvent', { type: 'mouseWheel', x: box.x, y: box.y, deltaX: 0, deltaY: 0 });
+  }
+  const metrics = (await cdp(tabId, 'Runtime.evaluate', {
+    expression: '({ h: innerHeight, y: scrollY, max: document.documentElement.scrollHeight })',
+    returnByValue: true,
+  })) as { result?: { value?: { h: number; y: number; max: number } } };
+  const m = metrics.result?.value ?? { h: 800, y: 0, max: 800 };
+  const delta =
+    direction === 'top' ? -m.max : direction === 'bottom' ? m.max : Math.round(m.h * amount) * (direction === 'up' ? -1 : 1);
+  await cdp(tabId, 'Input.dispatchMouseEvent', {
+    type: 'mouseWheel',
+    x: Math.round(m.h / 2),
+    y: Math.round(m.h / 2),
+    deltaX: 0,
+    deltaY: delta,
+  });
+  await sleep(150);
+  const after = (await cdp(tabId, 'Runtime.evaluate', {
+    expression: `({ y: Math.round(scrollY), max: Math.max(1, document.documentElement.scrollHeight - innerHeight) })`,
+    returnByValue: true,
+  })) as { result?: { value?: { y: number; max: number } } };
+  const a = after.result?.value ?? { y: 0, max: 1 };
+  return {
+    scrollY: a.y,
+    scrollHeight: m.max,
+    atBottom: a.y >= a.max - 4,
+    atTop: a.y <= 4,
+    pct: Math.round((a.y / a.max) * 100),
+  };
+}
+
+async function cdpHover(tabId: number, p: ActionParams): Promise<Record<string, unknown>> {
+  const box = await cdpPoint(tabId, p);
+  if (!box) throw new Error('element not found');
+  await cdp(tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: box.x, y: box.y, button: 'none' });
+  await sleep(150);
+  return { hovered: { role: 'element', name: box.name }, viaCdp: true };
+}
+
+async function cdpScreenshot(tabId: number): Promise<string> {
+  const res = (await cdp(tabId, 'Page.captureScreenshot', {
+    format: 'png',
+    captureBeyondViewport: false,
+  })) as { data?: string } | undefined;
+  if (!res?.data) throw new Error('no screenshot data');
+  return `data:image/png;base64,${res.data}`;
 }
 
 /* ------------------------------------------------------------------ */
@@ -721,23 +931,58 @@ const methods: Record<string, Method> = {
   },
 
   async 'page.type'(p: ActionParams = {}) {
-    const tab = await resolveTab(p);
-    return callPage(tab, 'type', p);
+    const tab = await resolveTab(p, { page: false });
+    await assertAllowed(tab);
+    try {
+      return await cdpType(tab.id!, p);
+    } catch {
+      return callPage(tab, 'type', p);
+    }
   },
 
   async 'page.key'(p: ActionParams = {}) {
-    const tab = await resolveTab(p);
-    return callPage(tab, 'key', p);
+    const tab = await resolveTab(p, { page: false });
+    await assertAllowed(tab);
+    const combo = String(p.keys || p.key || '');
+    if (!combo) throw fail('bad_request', 'Provide keys, e.g. "Enter", "Escape", "Meta+a".');
+    try {
+      if (p.ref !== undefined || p.selector) {
+        const box = await cdpPoint(tab.id!, p);
+        if (box) {
+          await cdp(tab.id!, 'Input.dispatchMouseEvent', {
+            type: 'mousePressed', x: box.x, y: box.y, button: 'left', buttons: 1, clickCount: 1,
+          });
+          await cdp(tab.id!, 'Input.dispatchMouseEvent', {
+            type: 'mouseReleased', x: box.x, y: box.y, button: 'left', buttons: 0, clickCount: 1,
+          });
+        }
+      }
+      await pressKey(tab.id!, combo);
+      await sleep(120);
+      return { key: combo, handled: 'cdp', submitted: combo === 'Enter' || undefined };
+    } catch {
+      return callPage(tab, 'key', p);
+    }
   },
 
   async 'page.scroll'(p: ActionParams = {}) {
-    const tab = await resolveTab(p);
-    return callPage(tab, 'scroll', p);
+    const tab = await resolveTab(p, { page: false });
+    await assertAllowed(tab);
+    try {
+      return await cdpScroll(tab.id!, p);
+    } catch {
+      return callPage(tab, 'scroll', p);
+    }
   },
 
   async 'page.hover'(p: ActionParams = {}) {
-    const tab = await resolveTab(p);
-    return callPage(tab, 'hover', p);
+    const tab = await resolveTab(p, { page: false });
+    await assertAllowed(tab);
+    try {
+      return await cdpHover(tab.id!, p);
+    } catch {
+      return callPage(tab, 'hover', p);
+    }
   },
 
   async 'page.select'(p: ActionParams = {}) {
@@ -775,6 +1020,20 @@ const methods: Record<string, Method> = {
   async 'page.eval'(p: ActionParams = {}) {
     const tab = await resolveTab(p);
     if (!p.expression) throw fail('bad_request', 'page.eval needs an expression');
+    // The debugger's Runtime.evaluate is not subject to the page's Trusted
+    // Types or CSP, so it works on Google properties where injected eval fails.
+    try {
+      const res = (await cdp(tab.id!, 'Runtime.evaluate', {
+        expression: String(p.expression),
+        returnByValue: true,
+        awaitPromise: true,
+        userGesture: true,
+      })) as { result?: { value?: unknown }; exceptionDetails?: { text?: string } };
+      if (res.exceptionDetails) throw new Error(res.exceptionDetails.text || 'evaluation failed');
+      return { value: res.result?.value, world: 'page' };
+    } catch {
+      /* fall through to the injected path */
+    }
     await ensureInjected(tab.id!);
 
     type EvalResult = { ok: boolean; value?: unknown; error?: string };
