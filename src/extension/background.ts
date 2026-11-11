@@ -20,7 +20,7 @@ import type {
   TabDescriptor,
 } from '../shared/types';
 
-const VERSION = '1.5.2';
+const VERSION = '1.5.8';
 const PORT = 8737;
 const WS_URL = `ws://127.0.0.1:${PORT}/ws`;
 const GROUP_TITLE = 'Agent';
@@ -772,16 +772,51 @@ async function cdpHover(tabId: number, p: ActionParams): Promise<Record<string, 
  */
 async function cdpUpload(tabId: number, p: ActionParams): Promise<Record<string, unknown>> {
   if (!p.selector || !p.file) throw new Error('upload needs a selector and a path');
-  const doc = (await cdp(tabId, 'DOM.getDocument', { depth: -1 })) as { root: { nodeId: number } };
-  const list = (await cdp(tabId, 'DOM.querySelectorAll', {
-    nodeId: doc.root.nodeId,
-    selector: p.selector,
-  })) as { nodeIds: number[] };
-  const nodeId = list?.nodeIds?.[Number(p.index) || 0];
-  if (!nodeId) throw new Error(`no file input matching ${p.selector}`);
-  await cdp(tabId, 'DOM.setFileInputFiles', { nodeId, files: [p.file] }, { raceAck: false });
+  // The DOM agent must be enabled before it will accept a node reference.
+  await cdp(tabId, 'DOM.enable');
+
+  const index = Number(p.index) || 0;
+  let nodeId: number | undefined;
+
+  // Path 1: objectId straight from the evaluate (works when the object is a
+  // live node wrapper).
+  try {
+    const obj = (await cdp(tabId, 'Runtime.evaluate', {
+      expression: `document.querySelectorAll(${JSON.stringify(p.selector)})[${index}] || null`,
+    })) as { result?: { objectId?: string } };
+    if (obj.result?.objectId) {
+      await cdp(tabId, 'DOM.setFileInputFiles', { objectId: obj.result.objectId, files: [p.file] }, { raceAck: false });
+      nodeId = 1;
+    }
+  } catch {
+    nodeId = undefined;
+  }
+
+  // Path 2: tag the element, then address it by attribute.
+  if (!nodeId) {
+    await cdp(tabId, 'Runtime.evaluate', {
+      expression: `(() => {
+        document.querySelectorAll('[data-bb-upload]').forEach((el) => el.removeAttribute('data-bb-upload'));
+        const el = document.querySelectorAll(${JSON.stringify(p.selector)})[${index}];
+        if (el) el.setAttribute('data-bb-upload', '1');
+      })()`,
+    });
+    const doc = (await cdp(tabId, 'DOM.getDocument', { depth: 1 })) as { root?: { nodeId: number } };
+    if (doc.root?.nodeId) {
+      const found = (await cdp(tabId, 'DOM.querySelector', {
+        nodeId: doc.root.nodeId,
+        selector: '[data-bb-upload]',
+      })) as { nodeId?: number };
+      if (found?.nodeId) {
+        await cdp(tabId, 'DOM.setFileInputFiles', { nodeId: found.nodeId, files: [p.file] }, { raceAck: false });
+        nodeId = found.nodeId;
+      }
+    }
+  }
+
+  if (!nodeId) throw new Error(`could not set the file input ${p.selector}`);
   await cdp(tabId, 'Runtime.evaluate', {
-    expression: `(() => { const el = document.querySelector(${JSON.stringify(p.selector)}); if (el) { el.dispatchEvent(new Event('input', {bubbles:true})); el.dispatchEvent(new Event('change', {bubbles:true})); } })()`,
+    expression: `(() => { const el = document.querySelectorAll(${JSON.stringify(p.selector)})[${index}]; if (el) { el.dispatchEvent(new Event('input', {bubbles:true})); el.dispatchEvent(new Event('change', {bubbles:true})); } })()`,
   });
   await sleep(400);
   return { uploaded: p.file, viaCdp: true };

@@ -510,8 +510,10 @@ const commands: Record<string, (ctx: CommandContext) => Promise<void>> = {
   },
 
   async upload({ args, flags }) {
-    const [selector, file] = args;
-    if (!selector || !file) die('usage: chromectl upload <css file input> <path>');
+    const [rawSelector, file] = args;
+    if (!rawSelector || !file) die('usage: chromectl upload <css file input> <path>');
+    // Accept the usual css= prefix, but the DOM selector must not carry it.
+    const selector = rawSelector.replace(/^(css|selector)=/, '');
     const r = await rpc<{ uploaded: string }>('page.upload', {
       ...tabParam(flags),
       selector,
