@@ -20,7 +20,7 @@ import type {
   TabDescriptor,
 } from '../shared/types';
 
-const VERSION = '1.5.0';
+const VERSION = '1.5.1';
 const PORT = 8737;
 const WS_URL = `ws://127.0.0.1:${PORT}/ws`;
 const GROUP_TITLE = 'Agent';
@@ -766,6 +766,26 @@ async function cdpHover(tabId: number, p: ActionParams): Promise<Record<string, 
   return { hovered: { role: 'element', name: box.name }, viaCdp: true };
 }
 
+/**
+ * Set a file input. `Input.*` cannot point at a local path, so this goes through
+ * DOM.setFileInputFiles, which is what a real file picker would do.
+ */
+async function cdpUpload(tabId: number, p: ActionParams): Promise<Record<string, unknown>> {
+  if (!p.selector || !p.file) throw new Error('upload needs a selector and a path');
+  const doc = (await cdp(tabId, 'DOM.getDocument', { depth: -1 })) as { root: { nodeId: number } };
+  const found = (await cdp(tabId, 'DOM.querySelector', {
+    nodeId: doc.root.nodeId,
+    selector: p.selector,
+  })) as { nodeId: number };
+  if (!found?.nodeId) throw new Error(`no file input matching ${p.selector}`);
+  await cdp(tabId, 'DOM.setFileInputFiles', { nodeId: found.nodeId, files: [p.file] }, { raceAck: false });
+  await cdp(tabId, 'Runtime.evaluate', {
+    expression: `(() => { const el = document.querySelector(${JSON.stringify(p.selector)}); if (el) { el.dispatchEvent(new Event('input', {bubbles:true})); el.dispatchEvent(new Event('change', {bubbles:true})); } })()`,
+  });
+  await sleep(400);
+  return { uploaded: p.file, viaCdp: true };
+}
+
 async function cdpScreenshot(tabId: number): Promise<string> {
   const res = (await cdp(tabId, 'Page.captureScreenshot', {
     format: 'png',
@@ -1175,6 +1195,13 @@ const methods: Record<string, Method> = {
       throw fail('eval_failed', out.error || 'evaluation failed');
     }
     return { value: out.value, world: world === 'MAIN' ? 'page' : 'isolated' };
+  },
+
+  async 'page.upload'(p: ActionParams = {}) {
+    const tab = await resolveTab(p, { page: false });
+    await assertAllowed(tab);
+    if (!p.file) throw fail('bad_request', 'page.upload needs a file path');
+    return cdpUpload(tab.id!, p);
   },
 
   async 'page.screenshot'(p: ActionParams = {}) {

@@ -509,6 +509,14 @@ const commands: Record<string, (ctx: CommandContext) => Promise<void>> = {
     out(typeof r.value === 'string' ? r.value : JSON.stringify(r.value, null, 2));
   },
 
+  async upload({ args, flags }) {
+    const [selector, file] = args;
+    if (!selector || !file) die('usage: chromectl upload <css file input> <path>');
+    const r = await rpc<{ uploaded: string }>('page.upload', { ...tabParam(flags), selector, file: path.resolve(file) });
+    if (flags.json) return out(JSON.stringify(r, null, 2));
+    out(`uploaded ${r.uploaded}`);
+  },
+
   async screenshot({ flags }) {
     const r = await rpc<{ path: string; width?: number; height?: number; url: string; borrowed?: boolean }>('page.screenshot', tabParam(flags), 90_000);
     if (r.borrowed) process.stderr.write('chromectl: note: the debugger could not capture this tab (DevTools open?), so it was brought to front for a moment\n');
@@ -610,6 +618,7 @@ const commands: Record<string, (ctx: CommandContext) => Promise<void>> = {
   chromectl wait <css=|text=|url=|idle>  [--timeout ms] [--gone]
   chromectl find <text>             where does this text appear
   chromectl eval "<js>"             run JS in the page (blocked by strict CSP sites)
+  chromectl upload <css> <file>     set a file input
   chromectl screenshot [--out f]    capture the visible tab, returns a PNG path
   chromectl tabs [--all]            agent tabs (or every tab)
   chromectl activate                bring the agent tab to the front

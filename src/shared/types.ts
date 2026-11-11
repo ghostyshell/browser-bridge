@@ -150,6 +150,8 @@ export interface PageParams {
   viaCdp?: boolean;
   /** Force the content-script path instead of the debugger. */
   noCdp?: boolean;
+  /** Absolute path for page.upload. */
+  file?: string;
 }
 
 export interface Envelope<T = unknown> {
