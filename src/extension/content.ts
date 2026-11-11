@@ -76,7 +76,9 @@ declare global {
 
   function isVisible(el: Element | null): boolean {
     if (!el || !el.isConnected) return false;
-    if (el.closest('[aria-hidden="true"]')) return false;
+    // aria-hidden is only advisory: apps like Search Console mark their whole
+    // rendered body aria-hidden while a dialog is open. Geometry and computed
+    // style decide; aria-hidden alone does not disqualify an element.
     const cs = getComputedStyle(el);
     if (cs.display === 'none' || cs.visibility === 'hidden' || cs.visibility === 'collapse') return false;
     if (Number(cs.opacity) === 0) return false;

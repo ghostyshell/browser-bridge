@@ -678,11 +678,17 @@ const methods: Record<string, Method> = {
       return frames?.[0]?.result as EvalResult | undefined;
     };
 
+    // Two different walls send us to the isolated world: a CSP without
+    // unsafe-eval, and Trusted Types on the document (Google properties set
+    // require-trusted-types-for 'script').
+    const blocked = (msg: string) =>
+      /Content Security Policy|unsafe-eval|Trusted Type/i.test(msg);
+
     let out: EvalResult | undefined;
     let world: 'MAIN' | 'ISOLATED' = 'MAIN';
     try {
       out = await inject('MAIN');
-      if (out && !out.ok && /Content Security Policy|unsafe-eval/i.test(out.error || '')) {
+      if (out && !out.ok && blocked(out.error || '')) {
         world = 'ISOLATED';
         out = await inject('ISOLATED');
       }
@@ -691,10 +697,10 @@ const methods: Record<string, Method> = {
     }
     if (!out) throw fail('eval_failed', 'No result from page');
     if (!out.ok) {
-      if (/Content Security Policy|unsafe-eval/i.test(out.error || '')) {
+      if (blocked(out.error || '')) {
         throw fail(
           'eval_blocked',
-          "This site's Content-Security-Policy blocks eval, so page.eval cannot run here. Use snapshot, text, find, links or query instead.",
+          `The page blocks eval (${out.error}). page.eval cannot run here; use snapshot, text, find, links or query instead.`,
         );
       }
       throw fail('eval_failed', out.error || 'evaluation failed');
