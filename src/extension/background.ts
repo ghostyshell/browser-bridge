@@ -20,7 +20,7 @@ import type {
   TabDescriptor,
 } from '../shared/types';
 
-const VERSION = '1.4.0';
+const VERSION = '1.4.1';
 const PORT = 8737;
 const WS_URL = `ws://127.0.0.1:${PORT}/ws`;
 const GROUP_TITLE = 'Agent';
@@ -64,9 +64,12 @@ type Method = (params: ActionParams) => Promise<unknown>;
 /* ------------------------------------------------------------------ */
 
 async function getSettings(): Promise<Settings> {
+  // Auto-approve defaults on: the per-site gate still records every origin and
+  // still prompts when the user turns it off, but a fresh install (or a reload
+  // that lost storage) is usable immediately instead of blocking the first call.
   return (await chrome.storage.local.get({
     allowedOrigins: [],
-    autoAllow: false,
+    autoAllow: true,
     pendingOrigin: null,
   })) as Settings;
 }
