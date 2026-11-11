@@ -20,7 +20,7 @@ import type {
   TabDescriptor,
 } from '../shared/types';
 
-const VERSION = '1.3.0';
+const VERSION = '1.3.1';
 const PORT = 8737;
 const WS_URL = `ws://127.0.0.1:${PORT}/ws`;
 const GROUP_TITLE = 'Agent';
@@ -412,9 +412,23 @@ function elementExpression(p: ActionParams): string {
     return `document.querySelectorAll(${sel})[${Number(p.index) || 0}]`;
   }
   if (p.text) {
-    const needle = JSON.stringify(String(p.text).toLowerCase());
-    return `[...document.querySelectorAll('a,button,[role=button],[role=link],[role=menuitem],[role=option],label,span')]
-      .find((el) => (el.innerText || el.getAttribute('aria-label') || '').trim().toLowerCase().includes(${needle}))`;
+    const needle = JSON.stringify(String(p.text).trim().toLowerCase());
+    // Visible elements only (menus keep hidden copies in the DOM), exact match
+    // first, then smallest containing match so a wrapper never wins over the
+    // item itself.
+    return `(() => {
+      const needle = ${needle};
+      const seen = [...document.querySelectorAll('a,button,[role=button],[role=link],[role=menuitem],[role=option],label,span,li')]
+        .filter((el) => {
+          const r = el.getBoundingClientRect();
+          return r.width > 1 && r.height > 1 && getComputedStyle(el).visibility !== 'hidden';
+        })
+        .map((el) => ({ el, text: (el.innerText || el.getAttribute('aria-label') || '').trim().toLowerCase() }))
+        .filter((c) => c.text.includes(needle));
+      if (!seen.length) return null;
+      const exact = seen.find((c) => c.text === needle);
+      return (exact || seen.sort((a, b) => a.text.length - b.text.length)[0]).el;
+    })()`;
   }
   return 'null';
 }
