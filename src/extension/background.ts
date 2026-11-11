@@ -448,6 +448,10 @@ const methods: Record<string, Method> = {
     const url = p.url || 'about:blank';
     await requireOrigin(url);
     const win = await chrome.windows.getLastFocused({ windowTypes: ['normal'] });
+    // What the user is reading right now. Chrome activates a tab that joins a
+    // collapsed group (and on some builds even an inactive create switches the
+    // visible tab), so the previous tab is restored explicitly below.
+    const [beforeActive] = await chrome.tabs.query({ windowId: win.id, active: true });
     let gid = win.id == null ? null : await groupForWindow(win.id);
     // Background by default: the user keeps the tab they were reading.
     const tab = await chrome.tabs.create({ url, windowId: win.id, active: p.active === true });
@@ -468,6 +472,9 @@ const methods: Record<string, Method> = {
       const groups = await loadGroups();
       groups[win.id!] = gid;
       await saveGroups(groups);
+    }
+    if (p.active !== true && beforeActive?.id != null && beforeActive.id !== tab.id) {
+      await chrome.tabs.update(beforeActive.id, { active: true }).catch(() => undefined);
     }
     const loaded = await waitForLoad(tab.id!, p.timeout ?? 20_000);
     const finalTab = loaded || (await chrome.tabs.get(tab.id!).catch(() => tab));
