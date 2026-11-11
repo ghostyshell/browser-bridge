@@ -20,7 +20,7 @@ import type {
   TabDescriptor,
 } from '../shared/types';
 
-const VERSION = '1.1.0';
+const VERSION = '1.2.0';
 const PORT = 8737;
 const WS_URL = `ws://127.0.0.1:${PORT}/ws`;
 const GROUP_TITLE = 'Agent';
@@ -335,6 +335,32 @@ async function navigationResult(tab: chrome.tabs.Tab): Promise<NavigationResult 
   return null;
 }
 
+/**
+ * Where the agent group belongs: the window that already holds it, otherwise the
+ * window with the most tabs (the one the user actually works in). A freshly
+ * opened window with a single tab, or the last-focused popup window, must not
+ * capture the group.
+ */
+async function chooseWindow(): Promise<chrome.windows.Window> {
+  const groups = await loadGroups();
+  const withGroup: number[] = [];
+  for (const gid of Object.values(groups)) {
+    try {
+      const g = await chrome.tabGroups.get(gid);
+      withGroup.push(g.windowId);
+    } catch {
+      /* group gone */
+    }
+  }
+  const windows = (await chrome.windows.getAll({ windowTypes: ['normal'], populate: true })).filter(
+    (w) => w.id != null,
+  );
+  const existing = windows.filter((w) => withGroup.includes(w.id!));
+  if (existing.length) return existing[0]!;
+  const busiest = [...windows].sort((a, b) => (b.tabs?.length ?? 0) - (a.tabs?.length ?? 0))[0];
+  return busiest ?? (await chrome.windows.getLastFocused({ windowTypes: ['normal'] }));
+}
+
 const NAV_ACTIONS = new Set<PageAction>(['click', 'key', 'type', 'select', 'hover']);
 
 async function callPage<T>(tab: chrome.tabs.Tab, action: PageAction, params: ActionParams = {}): Promise<T | NavigationResult> {
@@ -372,6 +398,22 @@ async function callPage<T>(tab: chrome.tabs.Tab, action: PageAction, params: Act
       }
       throw fail('no_response', `The page did not respond to ${action} (${(e2 as Error).message || e2}). Take a fresh snapshot and retry.`);
     }
+  }
+}
+
+/** One-shot CDP screenshot of a tab, attached and detached per capture. */
+async function cdpScreenshot(tabId: number): Promise<string> {
+  const target = { tabId };
+  await chrome.debugger.attach(target, '1.3');
+  try {
+    const res = (await chrome.debugger.sendCommand(target, 'Page.captureScreenshot', {
+      format: 'png',
+      captureBeyondViewport: false,
+    })) as { data?: string } | undefined;
+    if (!res?.data) throw new Error('no screenshot data');
+    return `data:image/png;base64,${res.data}`;
+  } finally {
+    await chrome.debugger.detach(target).catch(() => undefined);
   }
 }
 
@@ -447,7 +489,7 @@ const methods: Record<string, Method> = {
   async 'tab.open'(p: ActionParams = {}) {
     const url = p.url || 'about:blank';
     await requireOrigin(url);
-    const win = await chrome.windows.getLastFocused({ windowTypes: ['normal'] });
+    const win = await chooseWindow();
     // What the user is reading right now. Chrome activates a tab that joins a
     // collapsed group (and on some builds even an inactive create switches the
     // visible tab), so the previous tab is restored explicitly below.
@@ -718,27 +760,32 @@ const methods: Record<string, Method> = {
   async 'page.screenshot'(p: ActionParams = {}) {
     const tab = await resolveTab(p, { page: false });
     await assertAllowed(tab);
-    // captureVisibleTab only sees the *active* tab of a window, so the tab is
-    // borrowed for the length of the capture and handed straight back to
-    // whatever the user was reading. The window is deliberately NOT focused:
-    // pulling the whole browser in front of the terminal on every screenshot is
-    // the single biggest way an agent steals focus.
-    const [previous] = await chrome.tabs.query({ windowId: tab.windowId, active: true });
-    const borrowed = previous?.id !== tab.id;
-    if (borrowed) await chrome.tabs.update(tab.id!, { active: true });
     await sleep(p.delayMs ?? 250);
+    let meta: unknown = {};
     try {
-      const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
-      let meta: unknown = {};
-      try {
-        meta = await callPage(tab, 'viewport', {});
-      } catch {
-        /* viewport is nice to have */
-      }
+      meta = await callPage(tab, 'viewport', {});
+    } catch {
+      /* viewport is nice to have */
+    }
+
+    // Prefer the debugger: CDP screenshots capture a background tab without
+    // switching the visible one at all (the technique Playwright and browser-use
+    // rely on). captureVisibleTab is the fallback, and it does need the tab
+    // active, so there we borrow it and hand it straight back.
+    try {
+      const dataUrl = await cdpScreenshot(tab.id!);
       return { dataUrl, url: tab.url, title: tab.title, ...(meta as object) };
-    } finally {
-      if (borrowed && previous?.id != null) {
-        await chrome.tabs.update(previous.id, { active: true }).catch(() => undefined);
+    } catch {
+      const [previous] = await chrome.tabs.query({ windowId: tab.windowId, active: true });
+      const borrowed = previous?.id !== tab.id;
+      if (borrowed) await chrome.tabs.update(tab.id!, { active: true });
+      try {
+        const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
+        return { dataUrl, url: tab.url, title: tab.title, ...(meta as object) };
+      } finally {
+        if (borrowed && previous?.id != null) {
+          await chrome.tabs.update(previous.id, { active: true }).catch(() => undefined);
+        }
       }
     }
   },

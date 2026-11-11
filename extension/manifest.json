@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Browser Bridge",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Lets a local AI agent drive your real browser inside a dedicated tab group, with per-site permission.",
   "minimum_chrome_version": "116",
   "permissions": [
@@ -10,7 +10,8 @@
     "scripting",
     "storage",
     "alarms",
-    "activeTab"
+    "activeTab",
+    "debugger"
   ],
   "host_permissions": ["<all_urls>", "chrome-extension://*/*"],
   "background": {

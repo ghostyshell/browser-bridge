@@ -22,7 +22,7 @@ import type { Duplex } from 'node:stream';
 import { WebSocketServer, type WebSocket } from 'ws';
 import type { BridgeFailure, ExtensionInfo, HealthResult } from '../shared/types';
 
-const VERSION = '1.1.0';
+const VERSION = '1.2.0';
 const HOST = '127.0.0.1';
 const PORT = Number(process.env.BRIDGE_PORT || 8737);
 const PING_MS = 20_000;
