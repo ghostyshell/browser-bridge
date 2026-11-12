@@ -427,6 +427,7 @@ const commands: Record<string, (ctx: CommandContext) => Promise<void>> = {
         clear: !flags['no-clear'],
         submit: !!flags.submit,
         slow: flags.slow ? Number(flags.slow) || 60 : 0,
+        noCdp: !!flags['no-cdp'],
       },
     );
     if (flags.json) return out(JSON.stringify(r, null, 2));
@@ -507,6 +508,18 @@ const commands: Record<string, (ctx: CommandContext) => Promise<void>> = {
     const r = await rpc<{ value: unknown }>('page.eval', { ...tabParam(flags), expression });
     if (flags.json) return out(JSON.stringify(r, null, 2));
     out(typeof r.value === 'string' ? r.value : JSON.stringify(r.value, null, 2));
+  },
+
+  async cdp({ args, flags }) {
+    const [method, rawParams] = args;
+    if (!method) die('usage: chromectl cdp <Domain.method> [json-params]');
+    const r = await rpc<{ result: unknown }>('cdp.send', {
+      ...tabParam(flags),
+      method,
+      params: rawParams,
+    });
+    if (flags.json) return out(JSON.stringify(r, null, 2));
+    out(JSON.stringify(r.result ?? null, null, 2));
   },
 
   async upload({ args, flags }) {
@@ -626,6 +639,7 @@ const commands: Record<string, (ctx: CommandContext) => Promise<void>> = {
   chromectl find <text>             where does this text appear
   chromectl eval "<js>"             run JS in the page (blocked by strict CSP sites)
   chromectl upload <css> <file>     set a file input
+  chromectl cdp <Domain.m> [json]   raw CDP command (cookies, emulation)
   chromectl screenshot [--out f]    capture the visible tab, returns a PNG path
   chromectl tabs [--all]            agent tabs (or every tab)
   chromectl activate                bring the agent tab to the front

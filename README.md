@@ -172,9 +172,9 @@ Flags: `--tab N` to target a specific agent tab, `--json` for raw output.
 ## Limits (by design)
 
 - Screenshots are the visible viewport, not full page.
-- Cross-origin iframes are not traversed; same-page shadow DOM is not traversed.
+- Shadow DOM is traversed, so web-component forms (Reddit's login, for one) can be typed into and clicked. Cross-origin iframes are still not traversed, so a CAPTCHA checkbox needs a coordinate click (see `chromectl cdp`).
 - Synthetic keys cannot trigger native browser shortcuts. `Meta/Ctrl+A`, `Tab`, `Enter` and `Escape` are handled explicitly.
-- `chromectl eval` needs `eval` to be allowed by the site. Sites with a strict Content-Security-Policy (most production apps) block it, and you get `eval_blocked`; use `snapshot`, `query`, `text` or `find` there.
+- `chromectl eval` needs `eval` to be allowed by the site. Sites with a strict Content-Security-Policy (most production apps) block it, and you get `eval_blocked`; use `snapshot`, `query`, `text`, `find` or `chromectl cdp` there. `--no-cdp` forces the injected path for `click`/`type`, which is worth using where the debugger is refused.
 - `alert()` / `confirm()` block the page and will time out the command. Close the dialog in the browser.
 - File upload pickers, native downloads and permission prompts need a human.
 - Chrome pages (`chrome://`, the Web Store, PDF viewer) cannot be scripted.

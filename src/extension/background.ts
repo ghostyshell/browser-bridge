@@ -20,7 +20,7 @@ import type {
   TabDescriptor,
 } from '../shared/types';
 
-const VERSION = '1.5.8';
+const VERSION = '1.5.19';
 const PORT = 8737;
 const WS_URL = `ws://127.0.0.1:${PORT}/ws`;
 const GROUP_TITLE = 'Agent';
@@ -55,6 +55,8 @@ type ActionParams = PageParams & {
   url?: string;
   timeout?: number;
   delayMs?: number;
+  method?: string;
+  params?: string;
 };
 
 type Method = (params: ActionParams) => Promise<unknown>;
@@ -508,10 +510,14 @@ function cdpTouch(tabId: number): void {
  * attach. It changes nothing the user sees and never raises the window.
  */
 async function cdpSession(tabId: number): Promise<void> {
-  if (cdpAttached.has(tabId)) {
+  // The map alone is not proof: Chrome detaches on its own (devtools opened on
+  // the tab, renderer restart) and a stale entry then wedges every later
+  // command on that tab until the timeout.
+  if (cdpAttached.has(tabId) && (await debuggerAttached(tabId))) {
     cdpTouch(tabId);
     return;
   }
+  cdpAttached.delete(tabId);
   await chrome.debugger.attach({ tabId }, '1.3');
   await chrome.debugger.sendCommand({ tabId }, 'Page.enable').catch(() => undefined);
   await chrome.debugger
@@ -536,7 +542,33 @@ async function cdp(
 ): Promise<unknown> {
   await cdpSession(tabId);
   cdpTouch(tabId);
-  const call = chrome.debugger.sendCommand({ tabId }, method, params);
+  const send = async (): Promise<unknown> => chrome.debugger.sendCommand({ tabId }, method, params);
+  let call: Promise<unknown>;
+  try {
+    call = send();
+  } catch {
+    // A session Chrome has already dropped rejects every command; rebuild it
+    // once rather than letting the caller see a stale-attach failure.
+    await cdpDetach(tabId);
+    await cdpSession(tabId);
+    cdpTouch(tabId);
+    call = send();
+  }
+  call = call.catch(async () => {
+    await cdpDetach(tabId);
+    try {
+      await cdpSession(tabId);
+    } catch {
+      // Chrome keeps a target flagged as attached by a session that no longer
+      // answers (typically a previous instance of this extension). Only a
+      // navigation clears that, so take one.
+      await chrome.tabs.reload(tabId);
+      await sleep(1500);
+      await cdpSession(tabId);
+    }
+    cdpTouch(tabId);
+    return send();
+  });
   if (method.startsWith('Input.') && raceAck) {
     return Promise.race([call, sleep(400).then(() => undefined)]);
   }
@@ -585,15 +617,38 @@ function keyDescriptor(combo: string): { key: string; code: string; modifiers: n
   return { key, code, modifiers, text: key.length === 1 ? key : key === 'Enter' ? '\r' : undefined };
 }
 
+async function debuggerAttached(tabId: number): Promise<boolean> {
+  try {
+    const targets = await chrome.debugger.getTargets();
+    return targets.some((t) => t.tabId === tabId && t.attached);
+  } catch {
+    return false;
+  }
+}
+
 /** JS expression that resolves a click target from the same params the content
  *  script takes, so refs, selectors and text search behave identically. */
+/** Every element in the document, shadow roots included. Sites that build
+ *  their forms with web components (Reddit's login among them) keep the real
+ *  inputs in a shadow root, where a plain document.querySelector sees nothing. */
+const DEEP_ALL = `(() => {
+  const out: Element[] = [];
+  const walk = (node: Document | ShadowRoot | Element) => {
+    const kids = node.querySelectorAll ? [...node.querySelectorAll('*')] : [];
+    out.push(...kids);
+    for (const el of kids) if (el.shadowRoot) walk(el.shadowRoot);
+  };
+  walk(document);
+  return out;
+})()`;
+
 function elementExpression(p: ActionParams): string {
   if (p.ref !== undefined && p.ref !== null && p.ref !== '') {
     return `document.querySelector('[data-bb-ref="${String(p.ref).replace(/"/g, '\\"')}"]')`;
   }
   if (p.selector) {
     const sel = JSON.stringify(p.selector);
-    return `document.querySelectorAll(${sel})[${Number(p.index) || 0}]`;
+    return `(() => { const hits = ${DEEP_ALL}.filter((el) => el.matches(${sel})); return hits[${Number(p.index) || 0}] ?? null; })()`;
   }
   if (p.text) {
     const needle = JSON.stringify(String(p.text).trim().toLowerCase());
@@ -602,7 +657,7 @@ function elementExpression(p: ActionParams): string {
     // item itself.
     return `(() => {
       const needle = ${needle};
-      const seen = [...document.querySelectorAll('a,button,[role=button],[role=link],[role=menuitem],[role=option],label,span,li')]
+      const seen = ${DEEP_ALL}.filter((el) => el.matches('a,button,[role=button],[role=link],[role=menuitem],[role=option],label,span,li'))
         .filter((el) => {
           const r = el.getBoundingClientRect();
           return r.width > 1 && r.height > 1 && getComputedStyle(el).visibility !== 'hidden';
@@ -1134,6 +1189,15 @@ const methods: Record<string, Method> = {
     return callPage(tab, 'wait', p);
   },
 
+  /** Raw CDP passthrough, for the odd thing no verb covers (cookies, emulation). */
+  async 'cdp.send'(p: ActionParams = {}) {
+    const tab = await resolveTab(p, { page: false });
+    await assertAllowed(tab);
+    if (!p.method) throw fail('bad_request', 'cdp.send needs a method');
+    const params = p.params ? (JSON.parse(String(p.params)) as Record<string, unknown>) : {};
+    return { result: await cdp(tab.id!, String(p.method), params) };
+  },
+
   async 'page.find'(p: ActionParams = {}) {
     const tab = await resolveTab(p);
     return callPage(tab, 'find', p);
@@ -1161,17 +1225,35 @@ const methods: Record<string, Method> = {
     if (!p.expression) throw fail('bad_request', 'page.eval needs an expression');
     // The debugger's Runtime.evaluate is not subject to the page's Trusted
     // Types or CSP, so it works on Google properties where injected eval fails.
-    if (!p.noCdp) try {
-      const res = (await cdp(tab.id!, 'Runtime.evaluate', {
-        expression: String(p.expression),
-        returnByValue: true,
-        awaitPromise: true,
-        userGesture: true,
-      })) as { result?: { value?: unknown }; exceptionDetails?: { text?: string } };
-      if (res.exceptionDetails) throw new Error(res.exceptionDetails.text || 'evaluation failed');
-      return { value: res.result?.value, world: 'page' };
-    } catch {
-      /* fall through to the injected path */
+    if (!p.noCdp) {
+      const run = async () =>
+        (await cdp(tab.id!, 'Runtime.evaluate', {
+          expression: String(p.expression),
+          returnByValue: true,
+          awaitPromise: true,
+          userGesture: true,
+        })) as {
+          result?: { value?: unknown };
+          exceptionDetails?: { text?: string; exception?: { description?: string } };
+        };
+      // Chrome occasionally refuses the attach ("already attached by another
+      // extension") right after a navigation on some sites; a clean detach and
+      // a beat later it takes. Two tries, then fall back to injection.
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          const res = await run();
+          if (res.exceptionDetails)
+            throw new Error(
+              [res.exceptionDetails.text, res.exceptionDetails.exception?.description].filter(Boolean).join(' | ') ||
+                'evaluation failed',
+            );
+          return { value: res.result?.value, world: 'page' };
+        } catch (e) {
+          (p as ActionParams & { cdpError?: string }).cdpError = String(e);
+          await cdpDetach(tab.id!);
+          await sleep(250);
+        }
+      }
     }
     await ensureInjected(tab.id!);
 
@@ -1225,7 +1307,7 @@ const methods: Record<string, Method> = {
       if (blocked(out.error || '')) {
         throw fail(
           'eval_blocked',
-          `The page blocks eval (${out.error}). page.eval cannot run here; use snapshot, text, find, links or query instead.`,
+          `The page blocks eval (${out.error}). cdp=${(p as ActionParams & { cdpError?: string }).cdpError ?? 'ok'}. page.eval cannot run here; use snapshot, text, find, links or query instead.`,
         );
       }
       throw fail('eval_failed', out.error || 'evaluation failed');

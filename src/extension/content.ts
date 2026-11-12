@@ -292,30 +292,56 @@ declare global {
   /* element lookup                                                   */
   /* ---------------------------------------------------------------- */
 
+  /** Every element in the document, shadow roots included: several sites
+   *  (Reddit's login among them) keep their real inputs behind a web
+   *  component, where document.querySelector sees nothing. */
+  function deepAll(): El[] {
+    const out: El[] = [];
+    const walk = (node: Document | ShadowRoot | Element) => {
+      const kids = node.querySelectorAll ? Array.from(node.querySelectorAll('*')) : [];
+      for (const el of kids) {
+        out.push(el as El);
+        if ((el as Element & { shadowRoot?: ShadowRoot | null }).shadowRoot) {
+          walk((el as Element & { shadowRoot: ShadowRoot }).shadowRoot);
+        }
+      }
+    };
+    walk(document);
+    return out;
+  }
+
   function find(p: PageParams = {}): El {
     if (p.ref !== undefined && p.ref !== null && p.ref !== '') {
-      const el = document.querySelector(`[${REF}="${CSS.escape(String(p.ref))}"]`);
+      const el = deepAll().find((c) => c.getAttribute(REF) === String(p.ref));
       if (!el) {
         throw new Error(`Element [${p.ref}] is gone (page changed since the snapshot). Take a fresh snapshot.`);
       }
-      return el as El;
+      return el;
     }
     if (p.selector) {
-      const list = document.querySelectorAll(p.selector);
+      const list = deepAll().filter((el) => el.matches(p.selector!));
       if (!list.length) throw new Error(`No element matches selector "${p.selector}"`);
       const el = list[Number(p.index) || 0];
       if (!el) throw new Error(`Selector "${p.selector}" matched ${list.length} elements; index out of range`);
-      return el as El;
+      return el;
     }
     if (p.text) {
       const needle = collapse(p.text).toLowerCase();
-      const nodes = document.querySelectorAll('a,button,[role="button"],[role="link"],label,h1,h2,h3,h4');
+      // Interactive candidates beat headings on an exact match, so "Log In"
+      // picks the submit button rather than the page title.
+      const groups = [
+        'a,button,[role="button"],[role="link"]',
+        'label,span,li,h1,h2,h3,h4',
+      ];
+      const all = deepAll();
       let partial: El | null = null;
-      for (const node of nodes) {
-        const el = node as El;
-        const text = collapse(el.innerText).toLowerCase();
-        if (text === needle) return el;
-        if (!partial && text.includes(needle)) partial = el;
+      for (const group of groups) {
+        for (const el of all) {
+          if (!el.matches(group)) continue;
+          const text = collapse(el.innerText).toLowerCase();
+          if (text === needle) return el;
+          if (!partial && text.includes(needle)) partial = el;
+        }
       }
       if (partial) return partial;
       throw new Error(`No clickable element whose text contains "${p.text}"`);
